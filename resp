@@ -1,0 +1,299 @@
+package com.principal.hireprocess.domain;
+
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+
+public class WorkersResponse {
+    private ArrayList<items> items;
+    private int count;
+    private int currentItemIndex;
+    private String DateOfBirth;
+    private String PersonNumber;
+
+    public WorkersResponse(){
+        this.currentItemIndex = 0;
+    }
+
+    public int getCurrentItemIndex() {
+        setCurrentItemIndex();
+        return currentItemIndex;
+    }
+
+    public void setCurrentItemIndex(int currentItemIndex) {
+        this.currentItemIndex = currentItemIndex;
+    }
+
+    public String getStartDate(){
+        return items.get(currentItemIndex).getStartDate();
+    }
+
+    public String getEffectiveStartDate(){
+        return items.get(currentItemIndex).getEffectiveStartDate();
+    }
+
+    public String getEffectiveEndDate(){
+        return items.get(currentItemIndex).getEffectiveEndDate();
+    }
+
+    public String getPersonNumber() {
+		return PersonNumber;
+	}
+    
+    public String findLinkByName(String linkName){
+        this.setCurrentItemIndex();
+        for(links itemLink : items.get(this.currentItemIndex).getLinks()){
+            if (itemLink.getName().equals(linkName)){
+                return itemLink.getHref();
+            }
+        }
+        return null;
+    }
+
+    public ArrayList<WorkersResponse.items> getItems() {
+        return items;
+    }
+
+    public int getCount() {
+        return count;
+    }
+
+    public String findLinkbyRel(String relationship){
+        this.setCurrentItemIndex();
+        for(items item : items){
+            for(links itemLink : item.getLinks()){
+                if (itemLink.getRel().equals(relationship)){
+                    return itemLink.getHref();
+                }
+            }
+        }
+        return null;
+    }
+
+    public String getDateOfBirth() {
+        return DateOfBirth;
+    }
+
+    public String findLinkbyItemType(String fieldName, String inputType){
+        String itemLinkResult = null;
+        for(items item : items){
+            String thisType = "";
+            switch(fieldName){
+                case "EmailType":
+                    thisType = item.getEmailType();
+                    break;
+                case "PhoneType":
+                    thisType = item.getPhoneType();
+                    break;
+                case "AddressType":
+                    thisType = item.getAddressType();
+                    break;
+                case "ExternalIdentifierType":
+                    thisType = item.getExternalIdentifierType();
+                    break;
+                case "Unit":
+                    thisType = item.getUnit();
+                    break;
+                case "NationalIdentifierType":
+                    thisType = item.getNationalIdentifierType();
+                    break;
+                case "WorkerType":
+                    thisType = item.getWorkerType();
+                    break;
+                case "LicenseType":
+                    thisType = item.getLicenseType();
+                    break;
+            }
+            if (thisType.equals(inputType)) {
+                for (links itemLink : item.getLinks()) {
+                    if (itemLink.getRel().equals("self")) {
+                        itemLinkResult = itemLink.getHref();
+                    }
+                }
+            }
+        }
+        return itemLinkResult;
+    }
+
+    //used to set the index of the 'current' item when it's effective-dated
+    public void setCurrentItemIndex(){
+        Date mostRecentDate = null;
+
+        if (items.size() == 1){
+            this.setCurrentItemIndex(0);
+            return;
+        }
+
+        for (int i = 0; i < items.size(); i++) {
+            try {
+                DateFormat format = new SimpleDateFormat("yyyy-MM-dd");
+                Date thisDate = null;
+                String thisDateString = null;
+
+                if(items.get(i).getStartDate()!= null) {
+                    thisDateString = items.get(i).getStartDate();
+                } else
+                if (items.get(i).getEffectiveStartDate()!= null) {
+                    thisDateString = items.get(i).getEffectiveStartDate();
+                }
+                thisDate = format.parse(thisDateString);
+
+                if (mostRecentDate == null || (thisDate.after(mostRecentDate))) {
+                    mostRecentDate = thisDate;
+                    this.setCurrentItemIndex(i);
+                }
+            } catch (ParseException | ArrayIndexOutOfBoundsException e) {
+                System.out.println("Error encountered during setCurrentItemIndex");
+                e.printStackTrace();
+            }
+        }
+    }
+
+
+    public class items{
+        private ArrayList<links> links;
+        private String EffectiveStartDate;
+        private String EffectiveEndDate;
+        private Boolean PrimaryFlag;
+        private String StartDate;
+        private String EmailType;
+        private String PhoneType;
+        private String AddressType;
+        private String ExternalIdentifierType;
+        private String ActionCode;
+        private String Unit;
+        private String NationalIdentifierType;
+        private String LegalEmployerName;
+        private String WorkerType;
+        private String LastUpdatedBy;
+        private String AssignmentNumber;
+        private Long GradeId;
+        private String AssignmentId;
+        private String LicenseType;
+        private String GradeCode;
+        private String PersonNumber;
+        
+        
+        
+        public String getPersonNumber() {
+			return PersonNumber;
+		}
+
+		public String getGradeCode() {
+			return GradeCode;
+		}
+
+		public void setGradeCode(String gradeCode) {
+			GradeCode = gradeCode;
+		}
+
+        public Long getGradeId() {
+			return GradeId;
+		}
+
+		public void setGradeId(Long gradeId) {
+			GradeId = gradeId;
+		}
+		
+		public String getAssignmentId() {
+			return AssignmentId;
+		}
+
+		public void setAssignmentId(String assignmentId) {
+			AssignmentId = assignmentId;
+		}
+
+		public items(){
+            this.EffectiveStartDate = null;
+            this.StartDate = null;
+        }
+
+        public String getLastUpdatedBy() {
+            return LastUpdatedBy;
+        }
+
+        public String getWorkerType() {
+            return WorkerType;
+        }
+
+        public String getUnit() {
+            return Unit;
+        }
+
+        public String getExternalIdentifierType() {
+            return ExternalIdentifierType;
+        }
+
+        public ArrayList<links> getLinks(){
+            return this.links;
+        }
+
+        public String getEffectiveStartDate(){
+            return this.EffectiveStartDate;
+        }
+
+        public String getEffectiveEndDate(){
+            return this.EffectiveEndDate;
+        }
+
+        public String getStartDate(){
+            return this.StartDate;
+        }
+
+        public boolean isPrimary(){
+            return this.PrimaryFlag;
+        }
+
+        public String getEmailType() {
+            return EmailType;
+        }
+
+        public String getPhoneType() {
+            return PhoneType;
+        }
+
+        public String getAddressType() {
+            return AddressType;
+        }
+
+        public String getNationalIdentifierType() {
+            return NationalIdentifierType;
+        }
+
+        public String getLegalEmployerName() {
+            return LegalEmployerName;
+        }
+
+        public String getActionCode() {
+            return ActionCode;
+        }
+
+        public String getAssignmentNumber() {
+            return AssignmentNumber;
+        }
+        
+        public String getLicenseType(){
+        	return LicenseType;
+        }
+    }
+
+    class links{
+        private String rel;
+        private String href;
+        private String name;
+
+        public String getName(){
+            return this.name;
+        }
+
+        public String getRel(){
+            return this.rel;
+        }
+
+        public String getHref(){
+            return this.href;
+        }
+    }
+}
