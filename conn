@@ -1,0 +1,1968 @@
+package com.principal.hireprocess;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
+
+import com.google.gson.Gson;
+import com.principal.hireprocess.domain.*;
+import com.principal.hireprocess.domain.Ethnicities.Disabilities;
+
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
+import com.principal.hireprocess.domain.ErrorMessage;
+
+public class HCMConnector {
+
+	private static final String WORKERS_API = Common.URL.WORKERS_API.getUrlString();
+	private static final String JOB_API = Common.URL.JOB_API.getUrlString();
+	private static final String SALARY_API = Common.URL.SALARY_API.getUrlString();
+	private static final String SALARYBASIS_API = Common.URL.SALARYBASIS_API.getUrlString();
+	private static final String ACTION_API = Common.URL.ACTION_API.getUrlString();
+	private static final String GRADE_API = Common.URL.GRADE_API.getUrlString();
+	private static final String HCM_CREDENTIALS = Credentials.getHcmCredentials();
+
+	private static final String INTEGRATION_ACCOUNT_NAME = "PFG_REST_iCIMS";
+
+	private OkHttpClient client;
+	private MediaType mediaType;
+	private Logger logger;
+	private DateFormat dateFormat;
+	private Date todayDate;
+	private String todayString;
+
+	// Create Error Handling Objects
+    ErrorMessage errorMessage = new ErrorMessage();
+	ArrayList<String> captureErrorMsgs = new ArrayList<>();
+
+
+	public HCMConnector() {
+		this.logger = Logger.getLogger("HCMLoader");
+		this.mediaType = MediaType.get("application/vnd.oracle.adf.resourceitem+json");
+		this.client = new OkHttpClient().newBuilder().proxy(new Proxy(Proxy.Type.HTTP, new InetSocketAddress("pfgproxy.principal.com", 80)))
+				.readTimeout(1, TimeUnit.MINUTES).build();
+		this.dateFormat =  new SimpleDateFormat("yyyy-MM-dd");
+		this.todayString = dateFormat.format(Calendar.getInstance().getTime());
+		try{
+            this.todayDate = dateFormat.parse(todayString);
+        } catch (ParseException e){
+		    e.printStackTrace();
+        }
+
+	}
+
+	public ApiResponse processAPI(String url, String method, String jsonBody, String... patchData) throws IOException {
+
+		RequestBody body = (jsonBody == null) ? null : RequestBody.create(jsonBody, this.mediaType);
+
+		Request.Builder builder = new Request.Builder()
+				.url(url)
+				.addHeader("Authorization", HCM_CREDENTIALS)
+				.addHeader("Proxy-Authorization", Credentials.PROXY_CREDENTIALS)
+				.addHeader("REST-Framework-Version","4")
+				.method(method, body);
+
+		// If method is PATCH, need to add RangeMode header with dates
+		if (method.equals("PATCH")) {
+			String rangeString = "";
+			if (patchData.length == 3) {
+				rangeString = "RangeMode=" + patchData[0] + ";RangeStartDate=" + patchData[1] + ";RangeEndDate=" + patchData[2] + ";";
+			} else if (patchData.length == 2) {
+                rangeString = "RangeMode=" + patchData[0] + ";RangeStartDate=" + patchData[1] + ";";
+            }
+			builder.addHeader("Effective-Of", rangeString);
+		}
+
+		Request request = builder.build();
+		ApiResponse apiResponse = new ApiResponse();
+        Response response = this.client.newCall(request).execute();
+        apiResponse = new ApiResponse(response.isSuccessful(), response.code(), response.body().string());
+
+		return apiResponse;
+	}
+	public ApiResponse processAPI(String url, String method, String jsonBody, boolean header, String... patchData) throws IOException {
+
+		RequestBody body = (jsonBody == null) ? null : RequestBody.create(jsonBody, this.mediaType);
+
+		Request.Builder builder = new Request.Builder()
+				.url(url)
+				.addHeader("Authorization", HCM_CREDENTIALS)
+				.addHeader("Proxy-Authorization", Credentials.PROXY_CREDENTIALS)
+				.addHeader("REST-Framework-Version","4")
+				.method(method, body);
+
+		// If method is PATCH, need to add RangeMode header with dates
+		if(header && (method.equals("PATCH"))|| method.equals("DELETE")) {
+				String rangeString = "";
+				if (patchData.length == 3) {
+					rangeString = "RangeMode=" + patchData[0] + ";RangeStartDate=" + patchData[1] + ";RangeEndDate=" + patchData[2] + ";";
+				} else if (patchData.length == 2) {
+					rangeString = "RangeMode=" + patchData[0] + ";RangeStartDate=" + patchData[1] + ";";
+				} else if (patchData.length == 1){
+                    rangeString = "RangeMode=" + patchData[0] + ";";
+                }
+				builder.addHeader("Effective-Of", rangeString);
+		}
+		//Some APIs accept rangestartdate with POST
+		if(header && method.equals("POST")){
+            if (patchData.length == 1) {
+                String rangeString = "RangeStartDate=" + patchData[0] + ";";
+                builder.addHeader("Effective-Of", rangeString);
+            }
+        }
+
+		Request request = builder.build();
+
+		System.out.println("Headers = " + request.headers().toString());
+		System.out.println("Target URL =" + url );
+		System.out.println("Payload = " + jsonBody);
+
+		ApiResponse apiResponse = new ApiResponse();
+
+        Response response = this.client.newCall(request).execute();
+        apiResponse = new ApiResponse(response.isSuccessful(), response.code(), response.body().string());
+
+		return apiResponse;
+	}
+
+	public boolean createPendingWorker(ApiData data) throws IOException {
+		Gson gson = new Gson();
+		//set gradeId
+		String jobCode = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getJobCode();
+		Long gradeId = getGradeId(jobCode);
+		if(gradeId==null) {
+			logger.info("GradeID not found for JobCode: " + jobCode);
+		} else {
+			data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).setGradeCode(gradeId);
+		}
+
+		String currentRelationship = data.getCurrentRelationshipType();
+		switch(currentRelationship){
+			case "EMP":
+				//reclassify as Rehire
+				boolean rehireSuccessful = rehire(data);
+				if(rehireSuccessful){
+					//Change action code at iCIMS to 'Rehire'
+					ICIMSConnector icimsConnector = new ICIMSConnector();
+					if(Common.getInstance().getEnvironment()!= Common.Environment.PROD){
+						boolean isTestData = icimsConnector.isTestWorkflow(data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber(), data.getWorkflowId());
+						if(!isTestData){
+							logger.info("Unable to verify test data.  Skipping iCIMS action code update.");
+						} else {
+							logger.info("Verified test data - updating iCIMS action code.");
+							icimsConnector.updateIcimsonActionCode("REHIRE", data.getWorkflowId());
+						}
+					} else {
+						icimsConnector.updateIcimsonActionCode("REHIRE", data.getWorkflowId());
+					}
+				}
+				return rehireSuccessful;
+			case "CWK":
+				//create new Employee relationship
+				boolean formerContractorSuccessful = rehire(data);
+				return formerContractorSuccessful;
+			case "PWK":
+				logger.info("Existing record found, processing correction");
+				return updatePendingWorker(data);
+			default:
+				//process as new hire
+				ApiResponse response;
+				//get manager's assignment number
+				PendingWorker pendingWorker = data.getPendingWorker();
+				if(pendingWorker.getWorkRelationships().get(0).getAssignments().get(0).getManagers()!= null) {
+					Managers manager = pendingWorker.getWorkRelationships().get(0).getAssignments().get(0).getManagers().get(0);
+					String managerPersonNumber = manager.getPersonNumber();
+					String managerAssignmentNumber = getManagerAssignmentNumber(managerPersonNumber);
+					manager.setManagerAssignmentNumber(managerAssignmentNumber);
+					manager.setPersonNumber(null);
+					ArrayList<Managers> managersList = new ArrayList<>();
+					managersList.add(manager);
+					pendingWorker.getWorkRelationships().get(0).getAssignments().get(0).setManagers(managersList);
+				}
+				String SDT = "";
+				if(pendingWorker.getDisabilities()!= null){
+					SDT = pendingWorker.getDisabilities().get(0).getSelfDisclosedType();
+					pendingWorker.setDisabilities(null);
+				}
+				String payload = gson.toJson(data.getPendingWorker());
+				System.out.println(payload);
+				response = processAPI(WORKERS_API, "", payload);
+
+				if (!response.isSuccessful()) {
+					logError(response.getResponse(), response.getStatusCode(), WORKERS_API, payload);
+					data.setPersonNumber("N/A");
+					// Add Error Message Information here to use for Error Email
+					EmailErrorResponse errorResponse = gson.fromJson(response.getResponse(), EmailErrorResponse.class);
+					String details = errorResponse.getOErrorDetails().get(0).getDetails();
+					captureErrorMsgs.add("Unable to create new worker: ("+details+")");
+					errorMessage.setApplicantId(data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber());
+					errorMessage.setErrorMessageList(captureErrorMsgs);
+					// Generate Error Email
+					sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				}
+				else if(response.isSuccessful()){
+					logger.info("Successfully created pending worker.");
+					data.setPersonNumber("N/A");
+					
+					String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+					String workersUrl = WORKERS_API + "?q=externalIdentifiers.ExternalIdentifierType='iCIMS Applicant ID' and externalIdentifiers.ExternalIdentifierNumber='" + applicantId +"'";
+					//Identify Pending Worker relationship
+					String workRelationshipsLink = getApiLink("workRelationships", workersUrl);
+					if (workRelationshipsLink.isEmpty()){
+						captureErrorMsgs.add("No results found when searching for link workRelationships.");
+						// Generate Error Email Message
+						errorMessage.setApplicantId(applicantId);
+						errorMessage.setErrorMessageList(captureErrorMsgs);
+						sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+
+					}
+					
+					// Get Assignments link from WorkRelationships
+					String assignmentsLink = getApiLink("assignments", workRelationshipsLink);
+					if (assignmentsLink.isEmpty()){
+						captureErrorMsgs.add("No results found when searching for link assignments.");
+						// Generate Error Email Message
+						errorMessage.setApplicantId(applicantId);
+						errorMessage.setErrorMessageList(captureErrorMsgs);
+						sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+					}
+
+					// Get Assignments SELF link
+					String result3 = processAPI(assignmentsLink, "GET", null).getResponse();
+					WorkersResponse assignmentLinkResponse = gson.fromJson(result3, WorkersResponse.class);
+					String assignmentId = assignmentLinkResponse.getItems().get(0).getAssignmentId();
+					String assignmentNum  = assignmentLinkResponse.getItems().get(0).getAssignmentNumber();
+					String effectiveDate = assignmentLinkResponse.getItems().get(0).getEffectiveStartDate();
+					
+					//Adding salary
+					//String dateString = getSysDate();
+					String dateString = effectiveDate;
+					String salaryAmt = data.getSalary().getSalaryAmount();
+					String salaryBasisCode = getSalaryBasisCode(data, gradeId);
+					String salaryActionCode = data.getSalary().getSalaryActionCode();
+					String salPayload = addSalary(assignmentId, salaryBasisCode, salaryActionCode, dateString, salaryAmt);
+					if(!salPayload.isEmpty()){
+						ApiResponse salResponse = processAPI(SALARY_API, "POST", salPayload);
+						if(!salResponse.isSuccessful()){
+							logger.info("Unable to add Salary");
+							logError(salResponse.getResponse(), salResponse.getStatusCode(), SALARY_API, salPayload);
+							// Add Error Message Information here to use for Error Email
+							errorMessage.setApplicantId(applicantId);
+							captureErrorMsgs.add("Unable to add Salary");
+							errorMessage.setErrorMessageList(captureErrorMsgs);
+							sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+						} else {
+							logger.info("Salary added successfully");
+						}
+					} else {
+						logger.info("Salary payload empty");
+					}
+					
+					//Printing data to file
+					boolean filePrint = SuccessUtility.successFile(applicantId, assignmentNum, data.getCurrentRelationshipType());
+					if(!filePrint){
+						logger.info("Error printing into HireSuccess.csv file");
+					}
+
+					//String SDT = Disabilities.getSelfDisclosedType();
+					String BusUnit = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+
+					if(SDT != null && !SDT.isEmpty()){
+						switch(BusUnit){
+						case "PFG US" :
+							WorkersResponse pwrResponse = gson.fromJson(response.getResponse(), WorkersResponse.class);
+							String PersonNum = pwrResponse.getPersonNumber();
+							boolean disability = addDisability(PersonNum,SDT,data);
+							break;
+						default :
+							break;
+						}
+					}
+				}
+				return response.isSuccessful();
+		}
+	}
+
+	private String getApiLink(String linkName, String url ) throws IOException {
+		Gson gson = new Gson();
+		String result = processAPI(url, "GET", null).getResponse();
+		String link;
+		WorkersResponse workersResponse = gson.fromJson(result, WorkersResponse.class);
+
+		if(workersResponse.getItems().size()==0){
+		    logger.info("No results found when searching for link " + linkName);
+		    return "";
+        }
+
+		if (linkName.equals("self")) {
+			link = workersResponse.findLinkbyRel(linkName);
+		} else {
+			link = workersResponse.findLinkByName(linkName);
+		}
+		return link;
+	}
+
+	public boolean updatePendingWorker(ApiData data) throws IOException {
+		Gson gson = new Gson();
+		boolean finalResponse = true;
+		boolean finalResponse1 = true;
+		// 1. Get WorkRelationships link
+		String url;
+		String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+		if (data.getType() == ApiData.Type.NEWHIRE) {
+			url = WORKERS_API + "?q=externalIdentifiers.ExternalIdentifierType='iCIMS Applicant ID' and externalIdentifiers.ExternalIdentifierNumber='" + applicantId +"'";
+			data.setPersonNumber("N/A");
+		} else {
+			url = WORKERS_API + "?q=PersonNumber=" + data.getPersonNumber();
+		}
+		String SDT = "";
+		if(data.getPendingWorker().getDisabilities()!= null){
+			SDT = data.getPendingWorker().getDisabilities().get(0).getSelfDisclosedType();
+			data.getPendingWorker().setDisabilities(null);
+		}
+		//Identify Pending Worker relationship
+		String workRelationshipsLink = getApiLink("workRelationships", url);
+		if (workRelationshipsLink.isEmpty()){
+			captureErrorMsgs.add("No results found when searching for link workRelationships.");
+			// Generate Error Email Message
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			return false;
+		}
+		WorkersResponse workRelResponse = gson.fromJson(processAPI(workRelationshipsLink,"GET", null).getResponse(), WorkersResponse.class);
+		int currentRelationshipIndex = workRelResponse.getCurrentItemIndex();
+		WorkersResponse.items currentRelationship = workRelResponse.getItems().get(currentRelationshipIndex);
+		//verify that the current relationship is of type "P" (pending worker)
+		if(!currentRelationship.getWorkerType().equals("P")){
+			logger.info("Applicant's current relationship is not of type Pending Worker.  Unable to update.");
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("Applicant's current relationship is not of type Pending Worker.  Unable to update.");
+            // Generate Error Email Message
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			return false;
+		}
+
+        // 2. Check for changes to the legal employer
+        WorkRelationships newRelationship = data.getPendingWorker().getWorkRelationships().get(0);
+        String legalEmployer = newRelationship.getLegalEmployerName();
+        if (!workRelResponse.getItems().get(currentRelationshipIndex).getLegalEmployerName().equals(legalEmployer)){
+            logger.info("Found change in legal employer - needs to be manually corrected in HCM");
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("Found change in legal employer - needs to be manually corrected in HCM");
+        }
+
+		// 3.Get Assignments link from WorkRelationships
+		String assignmentsLink = getApiLink("assignments", workRelationshipsLink);
+		if (assignmentsLink.isEmpty()){
+			captureErrorMsgs.add("No results found when searching for link assignments.");
+			// Generate Error Email Message
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			return false;
+
+		}
+
+		// 4.Get Assignments SELF link
+		String result3 = processAPI(assignmentsLink, "GET", null).getResponse();
+		WorkersResponse assignmentLinkResponse = gson.fromJson(result3, WorkersResponse.class);
+		String selfLink = assignmentLinkResponse.findLinkbyRel("self");
+
+		String assignmentStartDt = assignmentLinkResponse.getEffectiveStartDate();
+		String assignmentEndDt = assignmentLinkResponse.getEffectiveEndDate();
+
+		//Get assignment data
+		Assignments assignments = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0);
+		Managers manager = null;
+		if(assignments.getManagers() != null) {
+			manager = assignments.getManagers().get(0);
+		}
+
+	 	ArrayList<WorkMeasures> workMeasuresArray = assignments.getWorkMeasures();
+		Contracts contract = null;
+		if(data.getPendingWorker().getWorkRelationships().get(0).getContracts()!= null) {
+			contract = data.getPendingWorker().getWorkRelationships().get(0).getContracts().get(0);
+		}
+		
+		String ActionCode = assignments.getActionCode();
+		String ReasonCode = assignments.getReasonCode();
+		//blank out elements that need to be updated in separate transactions or are never changed
+		assignments.setManagers(null);
+		assignments.setWorkMeasures(null);
+		//assignments.setActionCode(null);
+		assignments.setProposedUserPersonType(null);
+		//assignments.setReasonCode(null);
+		
+		String assignmentPayload = gson.toJson(assignments);
+		//Update assignment
+		ApiResponse assignmentResponse = processAPI(selfLink, "PATCH", assignmentPayload, true, "CORRECTION", assignmentStartDt, assignmentEndDt);
+		if (!assignmentResponse.isSuccessful()) {
+			logger.info("Error correcting assignment");
+			logError(assignmentResponse.getResponse(), assignmentResponse.getStatusCode(), selfLink, assignmentPayload);
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("Error correcting assignment");
+
+			finalResponse = false;
+		} else {
+			logger.info("Successfully corrected assignment");
+		}
+		
+		String BusUnit = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+		
+		//Update LocationID
+		if(BusUnit == "PFG US"){
+			if(assignments.getWorkAtHomeFlag() && assignmentResponse.isSuccessful() ){
+				String payload = "{\"ActionCode\":\"" + ActionCode + "\"," + "\"ReasonCode\":\"" + ReasonCode + "\"," + "\"LocationId\":" +  "null," +
+						"\"WorkAtHomeFlag\":" +  "true}";
+				
+				ApiResponse LocResponse = processAPI(selfLink, "PATCH", payload, true, "CORRECTION", assignmentStartDt, assignmentEndDt);
+				if (!LocResponse.isSuccessful()) {
+					logger.info("Error correcting LocationId");
+					logError(LocResponse.getResponse(), LocResponse.getStatusCode(), selfLink, payload);
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Error correcting LocationId");
+	
+					finalResponse = false;
+				} else {
+					logger.info("Successfully corrected LocationId");
+				}
+			}
+		}
+		
+		//update manager
+		if(manager != null && assignmentResponse.isSuccessful()) {
+			//First, get manager person number and add to the JSON
+			String managerPersonNumber = manager.getPersonNumber();
+			String managerAssignmentNumber = getManagerAssignmentNumber(managerPersonNumber);
+			if(!managerAssignmentNumber.isEmpty()) {
+				manager.setManagerAssignmentNumber(managerAssignmentNumber);
+				//set manager person number to null since it's not a valid field in the payload
+				manager.setPersonNumber(null);
+				manager.setActionCode(ActionCode);
+				manager.setReasonCode(ReasonCode);
+				String managersJson = gson.toJson(manager);
+
+				//get managers link from assignments
+				String managersLink = assignmentLinkResponse.findLinkByName("managers");
+				WorkersResponse managersLinkResponse = gson.fromJson(processAPI(managersLink, "GET", null).getResponse(), WorkersResponse.class);
+				String managerStartDt = managersLinkResponse.getEffectiveStartDate();
+				String managerEndDt = managersLinkResponse.getEffectiveEndDate();
+
+				//get managers SELF link and PATCH to that
+				String managerSelfLink = getApiLink("self", managersLink);
+				System.out.println("managerSelfLink = " + managerSelfLink);
+				if (managerSelfLink.isEmpty()){
+					captureErrorMsgs.add("No results found when searching for link managers SELF.");
+					// Generate Error Email Message
+					errorMessage.setApplicantId(applicantId);
+					errorMessage.setErrorMessageList(captureErrorMsgs);
+					sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+					//return false;
+
+				}
+
+
+				ApiResponse managersResponse = processAPI(managerSelfLink, "PATCH", managersJson, true, "CORRECTION", managerStartDt, managerEndDt);
+				if (!managersResponse.isSuccessful()) {
+					logError(managersResponse.getResponse(), managersResponse.getStatusCode(), managerSelfLink, managersJson);
+					// Add Error Message Information for Error Handling
+                    captureErrorMsgs.add("Error correcting manager assignment");
+					finalResponse1 = false;
+				} else {
+					logger.info("Successfully corrected manager assignment");
+				}
+			} else {
+				logger.info("Unable to determine manager assignment number.  Can't process manager change");
+			}
+		}
+
+		//Update WorkMeasures (FTE and Headcount)
+		/*if(workMeasuresArray != null && assignmentResponse.isSuccessful()){
+			for(WorkMeasures measure : workMeasuresArray) {
+				//Need to add ActionCode?
+				//workMeasures.setActionCode(actionCode);
+				String workMeasuresJson = gson.toJson(measure);
+				//get work measures link from assignments
+				String workMeasuresLink = assignmentLinkResponse.findLinkByName("workMeasures");
+				WorkersResponse measuresResponse = gson.fromJson(processAPI(workMeasuresLink, "GET", null).getResponse(), WorkersResponse.class);
+				String workMeasureStartDt = measuresResponse.getEffectiveStartDate();
+				String workMeasureEndDt = measuresResponse.getEffectiveEndDate();
+				//get managers SELF link and PATCH to that
+				String workMeasuresSelfLink = measuresResponse.findLinkbyItemType("Unit", measure.getUnit());
+				ApiResponse workMeasuresResponse = processAPI(workMeasuresSelfLink, "PATCH", workMeasuresJson, true, "CORRECTION", workMeasureStartDt, workMeasureEndDt);
+				if (!workMeasuresResponse.isSuccessful()) {
+					logError(workMeasuresResponse.getResponse(), workMeasuresResponse.getStatusCode(), workMeasuresSelfLink, workMeasuresJson);
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to correct work measures (FTE, Headcount)");
+					finalResponse1 = false;
+				} else {
+					logger.info("Successfully corrected work measures (FTE, headcount)");
+				}
+			}
+		}*/
+
+		//update contracts
+		if(contract != null && assignmentResponse.isSuccessful()){
+			String contractJson = gson.toJson(contract);
+			//get contracts link from workrelationships
+			String contractsLink = getApiLink("contracts", workRelationshipsLink);
+			if (contractsLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link contracts.");
+				// Generate Error Email Message
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				//return false;
+
+			}
+
+			String contractResult = processAPI(contractsLink, "GET", null).getResponse();
+			WorkersResponse contractLinkResponse = gson.fromJson(contractResult, WorkersResponse.class);
+			String contractSelfLink = contractLinkResponse.findLinkbyRel("self");
+			String contractStartDt = contractLinkResponse.getEffectiveStartDate();
+			String contractEndDt = contractLinkResponse.getEffectiveEndDate();
+			ApiResponse contractResponse = processAPI(contractSelfLink,"PATCH",contractJson,true,"CORRECTION",contractStartDt,contractEndDt);
+			if(!contractResponse.isSuccessful()){
+				logError(contractResponse.getResponse(), contractResponse.getStatusCode(), contractSelfLink, contractJson);
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to correct contract information");
+				finalResponse1 = false;
+			} else {
+				logger.info("Successfully corrected contract info");
+			}
+		}
+
+		//update personal info - phone, email, addr, legislative, date of birth
+		boolean personalInfoResponse = updatePersonalInfo(data.getPendingWorker(), url, "CORRECTION", data.getType());
+		if (!personalInfoResponse) {
+			finalResponse1 = false;
+			logger.info("Error correcting personal information");
+
+		}
+
+		//update salary
+		String assignmentId = assignmentLinkResponse.getItems().get(0).getAssignmentId();
+		String effectiveDate = assignmentLinkResponse.getItems().get(0).getEffectiveStartDate();
+		String jobCode = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getJobCode();
+		Long gradeId = getGradeId(jobCode);
+		if(gradeId==null) {
+			logger.info("GradeID not found for JobCode: " + jobCode);
+		}
+
+		if(assignmentId != null && assignmentResponse.isSuccessful()){
+			//String dateString = getSysDate();
+			String dateString = effectiveDate;
+			String salaryAmt = data.getSalary().getSalaryAmount();
+			String salaryBasisCode = getSalaryBasisCode(data, gradeId);
+			String salaryActionCode = data.getSalary().getSalaryActionCode();
+			ArrayList<String> salDet = getSalaryId(assignmentId, salaryBasisCode, dateString);
+			String salaryId = "";
+			if(!salDet.isEmpty()){
+			salaryId = salDet.get(0);
+			dateString = salDet.get(1);
+			}
+			String salPayload = addSalary(assignmentId, salaryBasisCode, salaryActionCode, dateString, salaryAmt);	
+			if(!salPayload.isEmpty()){
+				if(salaryId.isEmpty()){
+						ApiResponse salResponse = processAPI(SALARY_API, "POST", salPayload);
+						if(!salResponse.isSuccessful()){
+							logger.info("Unable to add Salary");
+							logError(salResponse.getResponse(), salResponse.getStatusCode(), SALARY_API, salPayload);
+							// Add Error Message Information here to use for Error Email
+							captureErrorMsgs.add("Unable to add Salary");
+							finalResponse1 = false;
+						}else{
+							logger.info("Salary added successfully");
+						}
+				}
+				else{
+					String updateUrl = SALARY_API + "/" + salaryId ;
+					ApiResponse salResponse = processAPI(updateUrl, "PATCH", salPayload, true, "UPDATE");
+					if(!salResponse.isSuccessful()){
+						logger.info("Unable to update Salary");
+						logError(salResponse.getResponse(), salResponse.getStatusCode(), updateUrl, salPayload);
+						// Add Error Message Information here to use for Error Email
+						captureErrorMsgs.add("Unable to update Salary");
+						finalResponse1 = false;
+						}else{
+							logger.info("Salary updated successfully");
+						}
+				}
+			}
+			else{
+				logger.info("Salary payload empty");
+			}
+		}
+
+		if(assignmentId != null && assignmentResponse.isSuccessful()){
+			String assignmentNum = assignmentLinkResponse.getItems().get(0).getAssignmentNumber();
+	        logger.info("Printing data into HireSuccess.csv file");
+	        if(!SuccessUtility.successFile(applicantId, assignmentNum, data.getCurrentRelationshipType()))
+	        {
+	          	logger.info("Error occured while printing HireSuccess.csv file");
+	           	captureErrorMsgs.add("Error occured while printing HireSuccess.csv file for : " + applicantId);
+	           	finalResponse1 = false ;
+	        }
+		}
+
+			//String SDT = Disabilities.getSelfDisclosedType();
+			//String BusUnit = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+			if(SDT != null && !SDT.isEmpty()){
+
+				switch(BusUnit){
+				case "PFG US":
+
+					String PersonNum = "";
+					if (data.getType() == ApiData.Type.NEWHIRE) {
+						WorkersResponse response = gson.fromJson(processAPI(url, "GET", null).getResponse(), WorkersResponse.class);
+						PersonNum = response.getItems().get(0).getPersonNumber();
+					} else {
+						PersonNum =  data.getPersonNumber();
+					}
+					boolean disability = addDisability(PersonNum,SDT,data);
+					if(disability){
+						logger.info("Successfully added disabilites");
+					}
+					break;
+
+				default :
+					break;
+				}
+			}
+		if(!finalResponse) {
+            // Generate Error Email Message
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(), errorMessage.getErrorMessageList(), data);
+        }
+
+		if(!finalResponse1) {
+            // Generate Error Email Message
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(), errorMessage.getErrorMessageList(), data);
+        }
+
+		return finalResponse;
+	}
+
+	public boolean rehire(ApiData data) throws IOException {
+		Gson gson = new Gson();
+		PendingWorker pw = data.getPendingWorker();
+		String baseUrl = WORKERS_API + "?q=PersonNumber=" + data.getPersonNumber();
+		String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+
+		boolean finalResult = true;
+		boolean finalResult1 = true;
+		String SDT = "";
+		if(pw.getDisabilities()!= null){
+			SDT = pw.getDisabilities().get(0).getSelfDisclosedType();
+			pw.setDisabilities(null);
+		}
+		// set GradeId
+		String jobCode = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getJobCode();
+		Long gradeId = getGradeId(jobCode);
+		if(gradeId==null) {
+			logger.info("GradeID not found for JobCode: " + jobCode);
+		} else {
+			data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).setGradeCode(gradeId);
+		}
+
+		String currentRelationship = data.getCurrentRelationshipType();
+		switch(currentRelationship){
+			//If current relationship EMP -> normal rehire.  If PWK-> Update.  If CWK -> Can process same as rehire but update iCIMS with action code afterwards.  If blank, error
+			case "CWK":
+			case "EMP":
+				//Normal rehire & new hire of existing contract worker
+				if(currentRelationship.equals("EMP")) {
+					logger.info("Rehire - adding work relationship");
+				} else {
+					logger.info("Hire of former contract worker - adding work relationship");
+				}
+				String workRelationshipsJson;
+				//get manager's assignment number
+				if(pw.getWorkRelationships().get(0).getAssignments().get(0).getManagers() != null) {
+					Managers manager = pw.getWorkRelationships().get(0).getAssignments().get(0).getManagers().get(0);
+					String managerPersonNumber = manager.getPersonNumber();
+					String managerAssignmentNumber = getManagerAssignmentNumber(managerPersonNumber);
+					manager.setManagerAssignmentNumber(managerAssignmentNumber);
+					System.out.println("Setting manager assignment number to " + managerAssignmentNumber);
+					manager.setPersonNumber(null);
+					ArrayList<Managers> managersList = new ArrayList<>();
+					managersList.add(manager);
+					pw.getWorkRelationships().get(0).getAssignments().get(0).setManagers(managersList);
+				}
+				workRelationshipsJson = gson.toJson(pw.getWorkRelationships().get(0));
+				String workRelationshipsLink = getApiLink("workRelationships", baseUrl);
+				ApiResponse wrResult = processAPI(workRelationshipsLink, "POST", workRelationshipsJson);
+				if (!wrResult.isSuccessful()) {
+					logError(wrResult.getResponse(), wrResult.getStatusCode(), workRelationshipsLink, workRelationshipsJson);
+					finalResult = false;
+
+					// Add Error Message Information here to use for Error Email
+					EmailErrorResponse errorResponse = gson.fromJson(wrResult.getResponse(), EmailErrorResponse.class);
+					String details = errorResponse.getOErrorDetails().get(0).getDetails();
+					captureErrorMsgs.add("Unable to add work relationship: ("+details+")");
+				} else {
+					boolean personalInfoResponse = updatePersonalInfo(data.getPendingWorker(), baseUrl, "UPDATE", data.getType());
+					if (!personalInfoResponse) {
+						finalResult1 = false;
+						logger.info("Error updating personal information");
+					}
+					if(currentRelationship.equals("CWK") && data.getType() == ApiData.Type.REHIRE){
+						//Change iCIMS action code to Hire for misclassified former contract worker hires
+						ICIMSConnector icimsConnector = new ICIMSConnector();
+						if(Common.getInstance().getEnvironment()!= Common.Environment.PROD){
+							boolean isTestData = icimsConnector.isTestWorkflow(applicantId, data.getWorkflowId());
+							if(!isTestData){
+								logger.info("Unable to verify test data.  Skipping iCIMS action code update.");
+							} else {
+								logger.info("Verified test data - updating iCIMS action code.");
+								icimsConnector.updateIcimsonActionCode("HIRE", data.getWorkflowId());
+							}
+						} else {
+							icimsConnector.updateIcimsonActionCode("HIRE", data.getWorkflowId());
+						}
+					}
+				}
+				break;
+			case "PWK":
+				//Update pending worker
+				logger.info("Updating pending worker info for rehire.");
+				return updatePendingWorker(data);
+			default:
+				//Error
+				String errorMessageString = "Error during rehire processing - no relationship found for applicant " + applicantId;
+				logger.info(errorMessageString);
+				captureErrorMsgs.add(errorMessageString);
+				// Generate Error Email Message
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				break;
+		}
+		
+		String workRelationshipsLink = getApiLink("workRelationships", baseUrl);
+		if (workRelationshipsLink.isEmpty()){
+			captureErrorMsgs.add("No results found when searching for link workRelationships.");
+			// Generate Error Email Message
+			//String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+		}
+		//Get Assignments link from WorkRelationships
+		String assignmentsLink = getApiLink("assignments", workRelationshipsLink);
+
+		// Get AssignmentID and startdate
+		String result3 = processAPI(assignmentsLink, "GET", null).getResponse();
+		WorkersResponse assignmentLinkResponse = gson.fromJson(result3, WorkersResponse.class);
+		String assignmentId = assignmentLinkResponse.getItems().get(0).getAssignmentId();
+		String assignmentNum = assignmentLinkResponse.getItems().get(0).getAssignmentNumber();
+		String effectiveDate = assignmentLinkResponse.getItems().get(0).getEffectiveStartDate();
+		
+		//update salary
+		if(assignmentId != null && finalResult){
+			//String dateString = getSysDate();
+			String dateString = effectiveDate;
+			String salaryAmt = data.getSalary().getSalaryAmount();
+			String salaryBasisCode = getSalaryBasisCode(data, gradeId);
+			String salaryActionCode = data.getSalary().getSalaryActionCode();
+			ArrayList<String> salDet = getSalaryId(assignmentId, salaryBasisCode, dateString);
+			String salaryId = "";
+			if(!salDet.isEmpty()){
+			salaryId = salDet.get(0);
+			dateString = salDet.get(1);
+			}
+			String salPayload = addSalary(assignmentId, salaryBasisCode, salaryActionCode, dateString, salaryAmt);
+			if(!salPayload.isEmpty()){
+				if(salaryId.isEmpty()){
+						ApiResponse salResponse = processAPI(SALARY_API, "POST", salPayload);
+						if(!salResponse.isSuccessful()){
+							logger.info("Unable to add Salary");
+							logError(salResponse.getResponse(), salResponse.getStatusCode(), SALARY_API, salPayload);
+							// Add Error Message Information here to use for Error Email
+							captureErrorMsgs.add("Unable to add Salary");
+							finalResult1 = false;
+						}else{
+							logger.info("Salary added successfully");
+						}
+				}
+				else{
+					String updateUrl = SALARY_API + "/" + salaryId ;
+					ApiResponse salResponse = processAPI(updateUrl, "PATCH", salPayload, true, "UPDATE");
+					if(!salResponse.isSuccessful()){
+						logger.info("Unable to update Salary");
+						logError(salResponse.getResponse(), salResponse.getStatusCode(), updateUrl, salPayload);
+						// Add Error Message Information here to use for Error Email
+						captureErrorMsgs.add("Unable to update Salary");
+						finalResult1 = false;
+					}else{
+						logger.info("Salary updated successfully");
+					}
+				}
+			}
+			else{
+			logger.info("Salary payload empty");
+			}
+		}
+		
+		//Printing data to file
+		boolean filePrint = SuccessUtility.successFile(applicantId, assignmentNum, data.getCurrentRelationshipType());
+		if(!filePrint){
+			logger.info("Error printing into HireSuccess.csv file");
+		}
+		
+		//String SDT = Disabilities.getSelfDisclosedType();
+		String BusUnit = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+		if(SDT != null && !SDT.isEmpty()){
+
+			switch(BusUnit){
+			case "PFG US":
+				String PersonNum =  data.getPersonNumber();
+				boolean disability = addDisability(PersonNum,SDT,data);
+				if(disability){
+					logger.info("Successfully added disabilites");
+				}
+				break;
+
+			default :
+				break;
+			}
+		}
+		// Generate Error Email Message
+        if(!finalResult) {
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(), errorMessage.getErrorMessageList(), data);
+        }
+        if(!finalResult1) {
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(), errorMessage.getErrorMessageList(), data);
+        }
+		return finalResult;
+	}
+
+	public boolean internalHire(ApiData data) throws IOException {
+		// only one assignment is expected
+		Gson gson = new Gson();
+		Assignments newAssignment = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0);
+		Long gradeId = getGradeId(newAssignment.getJobCode());
+		String startDate = newAssignment.getProjectedStartDate();
+		if(gradeId==null) {
+			logger.info("GradeID not found for JobCode: " + newAssignment.getJobCode());
+		} else {
+			newAssignment.setGradeCode(gradeId);
+		}
+		String newAssignmentActionCode = newAssignment.getActionCode();
+		
+		List<Managers> managers = null;
+		List<WorkMeasures> workMeasures = null;
+		List<Contracts> contracts = null;
+		String effectiveDate = null;
+		boolean isInternalHireUpdate = false; //used to track if the data is a new row or an update to existing row
+		boolean isStartDateOrActionAdjustment = false;
+
+		// Remove managers and workMeasures arrays - need to be sent separately
+		// Remove date - needs to be in the header
+		try {
+			managers = newAssignment.getManagers();
+			workMeasures = newAssignment.getWorkMeasures();
+			effectiveDate = newAssignment.getProjectedStartDate();
+			contracts = data.getPendingWorker().getWorkRelationships().get(0).getContracts();
+
+			if (effectiveDate == null) {
+				logger.info("No start date found for person number " + data.getPersonNumber() + ".  Unable to process.");
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("No start date found for person number " + data.getPersonNumber() + ".  Unable to process.");
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				return false;
+			}
+
+			newAssignment.setManagers(null);
+			newAssignment.setWorkMeasures(null);
+			newAssignment.setProjectedStartDate(null);
+
+		} catch (NullPointerException e) {
+			logger.info("No managers or work measures found");
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("No managers or work measures found");
+		}
+
+		//Get links
+				ArrayList<String> links = getLinks(data, effectiveDate);
+				String url = links.get(0);
+				String workRelationshipsLink = links.get(1);
+				String assignmentsLink = links.get(2);
+
+				// Get Assignments SELF link
+				String result = processAPI(assignmentsLink, "GET", null).getResponse();
+				WorkersResponse currentAssignmentResponse = gson.fromJson(result, WorkersResponse.class);
+
+		//Also check count on response to verify that there's only one assignment
+		WorkersResponse maxAssignment = getFutureAssignment(assignmentsLink);
+		Date maxAssignStartDate = getDateFromString(maxAssignment.getEffectiveStartDate());
+		Date newPayloadStartDate = getDateFromString(effectiveDate);
+		String maxAssignAction = maxAssignment.getItems().get(maxAssignment.getCurrentItemIndex()).getActionCode();
+
+		if (maxAssignStartDate.after(todayDate)) {
+            //Verify that future-dated row was added by iCIMS integration.  If not, take no action
+            String lastUpdatedBy = maxAssignment.getItems().get(0).getLastUpdatedBy();
+            if(!lastUpdatedBy.equals(INTEGRATION_ACCOUNT_NAME)){
+                logger.info("Future-dated row encountered which is not associated with recruitment integration.  Please add internal hire manually for person " + data.getPersonNumber());
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Future-dated row encountered which is not associated with recruitment integration.  Please add internal hire manually for person " + data.getPersonNumber());
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+                return false;
+            }
+			//if future row exists, we know that this new data is an update
+			isInternalHireUpdate = true;
+			if (!maxAssignStartDate.equals(newPayloadStartDate) || !maxAssignAction.equals(newAssignmentActionCode)) {
+				//if start dates or action codes differ, we need to delete the existing future-dated assignments
+				isStartDateOrActionAdjustment = true;
+			}
+		}
+
+		if (maxAssignment.getCount() > 1) {
+			logger.info("Multiple assignments found - needs to be handled manually!");
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("Multiple assignments found - needs to be handled manually!");
+			// Generate Error Email Message
+			String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			return false;
+		}
+
+		if (isStartDateOrActionAdjustment) {
+			//if start date or action code has changed, need to delete existing future-dated assignments
+			boolean futureAssignmentFound = true;
+			while (futureAssignmentFound) {
+				//Need to loop through all future-dated rows - could be multiple
+				WorkersResponse futureAssignment = getFutureAssignment(assignmentsLink);
+                if (futureAssignment.getCount() > 1) {
+                    logger.info("Multiple assignments found - needs to be handled manually!");
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Multiple assignments found - needs to be handled manually!");// Generate Error Email Message
+                    // Generate Error Email Message
+                    String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+                    errorMessage.setApplicantId(applicantId);
+                    errorMessage.setErrorMessageList(captureErrorMsgs);
+                    sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+                    return false;
+                }
+				Date futureStartDate = getDateFromString(futureAssignment.getEffectiveStartDate());
+				if (futureStartDate != null && futureStartDate.after(todayDate)) {
+					//Delete future assignment if it was LastUpdatedBy by PFG_REST_iCIMS
+					if (futureAssignment.getItems().get(0).getLastUpdatedBy().equals(INTEGRATION_ACCOUNT_NAME)) {
+						logger.info("Deleting assignment!!");
+						String futureAssignSelfLink = futureAssignment.findLinkbyRel("self");
+						ApiResponse deleteResponse = processAPI(futureAssignSelfLink, "DELETE", null, true, "DELETE_CHANGES", futureAssignment.getEffectiveStartDate(), futureAssignment.getEffectiveEndDate());
+						if (!deleteResponse.isSuccessful()) {
+							logError(deleteResponse.getResponse(), deleteResponse.getStatusCode(), futureAssignSelfLink, "");
+							// Add Error Message Information here to use for Error Email
+							captureErrorMsgs.add("Unable to delete existing assignments.");
+                            // Generate Error Email Message
+                            String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+                            errorMessage.setApplicantId(applicantId);
+                            errorMessage.setErrorMessageList(captureErrorMsgs);
+                            sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+                            return false;
+						} else {
+							logger.info("Successfully deleted existing assignment");
+						}
+					} else {
+						logger.info("Future-dated row encountered which is not associated with recruitment integration.  Please add internal hire manually for person " + data.getPersonNumber());
+						// Add Error Message Information here to use for Error Email
+						captureErrorMsgs.add("Future-dated row encountered which is not associated with recruitment integration.  Please add internal hire manually for person " + data.getPersonNumber());
+                        // Generate Error Email Message
+                        String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+                        errorMessage.setApplicantId(applicantId);
+                        errorMessage.setErrorMessageList(captureErrorMsgs);
+                        sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+						return false;
+					}
+				} else {
+					futureAssignmentFound = false;
+				}
+			}
+		}
+
+
+		boolean successful = true;
+		boolean finalResult = true;
+
+		//Update Managers
+		if (managers != null) {
+		 	Managers manager = managers.get(0);
+
+		 	//get manager assignment number using their person number
+			String managerAssignmentNumber = getManagerAssignmentNumber(manager.getPersonNumber());
+			if(!managerAssignmentNumber.isEmpty()){
+				manager.setManagerAssignmentNumber(managerAssignmentNumber);
+
+				//get managers link from assignments
+				String managersLink = currentAssignmentResponse.findLinkByName("managers");
+
+				//get managers SELF link and PATCH to that
+				String managerSelfLink = getApiLink("self", managersLink);
+				System.out.println("managerSelfLink = " + managerSelfLink);
+				if (managerSelfLink.isEmpty()){
+					captureErrorMsgs.add("No results found when searching for link managers self.");
+					// Generate Error Email Message
+					String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+					errorMessage.setApplicantId(applicantId);
+					errorMessage.setErrorMessageList(captureErrorMsgs);
+					sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+					return false;
+
+				}
+
+				//Set manager person number to null since not valid field in payload
+				manager.setPersonNumber(null);
+
+				ApiResponse managersResponse;
+				if (isInternalHireUpdate && !isStartDateOrActionAdjustment) {
+					managersResponse = processAPI(managerSelfLink, "PATCH", gson.toJson(manager), true, "CORRECTION", effectiveDate, "4712-12-31");
+				} else {
+					manager.setActionCode(newAssignmentActionCode);
+					//Need to add ActionCode to managersJson when it's a new row
+					managersResponse = processAPI(managerSelfLink, "PATCH", gson.toJson(manager), true, "UPDATE", effectiveDate);
+				}
+				if(!managersResponse.isSuccessful()){
+					logError(managersResponse.getResponse(), managersResponse.getStatusCode(), managerSelfLink, gson.toJson(manager));
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to  add new manager with managerAssignmentNumber = " + managerAssignmentNumber + " for PersonNumber " + data.getPersonNumber());
+					return false;
+				} else {
+					logger.info("Successfully added new manager with managerAssignmentNumber = " + managerAssignmentNumber + " for PersonNumber " + data.getPersonNumber());
+				}
+			} else {
+				logger.info("Unable to retrieve manager assignment number");
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to retrieve manager assignment number");
+			}
+		}else if(managers == null  ||  managers.isEmpty()){
+				captureErrorMsgs.add("No manager data available.");
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				return false;
+			}
+
+
+		//Update WorkMeasures (FTE and Headcount)
+		/*if(workMeasures != null && assignmentResult.isSuccessful()){
+			//Need to add ActionCode
+			for(WorkMeasures measure: workMeasures) {
+				//get work measures link from assignments
+				String workMeasuresLink ;
+				if(isInternalHireUpdate){
+                    workMeasuresLink = maxAssignment.findLinkByName("workMeasures");
+                } else {
+                    workMeasuresLink = currentAssignmentResponse.findLinkByName("workMeasures");
+                }
+
+				WorkersResponse measuresResponse = gson.fromJson(processAPI(workMeasuresLink, "GET", null).getResponse(), WorkersResponse.class);
+				String workMeasuresSelfLink = measuresResponse.findLinkbyItemType("Unit", measure.getUnit());
+				String workMeasuresJson;
+				ApiResponse workMeasuresResponse;
+				if(workMeasuresSelfLink == null || workMeasuresSelfLink.isEmpty()){
+				    //Post new work measure
+                    measure.setActionCode(newAssignmentActionCode);
+                    workMeasuresJson = gson.toJson(measure);
+                    workMeasuresResponse = processAPI(workMeasuresLink, "POST", workMeasuresJson, true, effectiveDate );
+                } else {
+                    measure.setActionCode(newAssignmentActionCode);
+                    workMeasuresJson = gson.toJson(measure);
+				    //Update or correct existing work measure
+                    if (isInternalHireUpdate && !isStartDateOrActionAdjustment) {
+                        workMeasuresResponse = processAPI(workMeasuresSelfLink, "PATCH", workMeasuresJson, true, "CORRECTION", effectiveDate, "4712-12-31");
+                    } else {
+                        measure.setActionCode(newAssignmentActionCode);
+                        workMeasuresResponse = processAPI(workMeasuresSelfLink, "PATCH", workMeasuresJson, true, "UPDATE", effectiveDate);
+                    }
+                    //workMeasuresResponse = processAPI(workMeasuresSelfLink, "PATCH", workMeasuresJson, true, "UPDATE", effectiveDate);
+                }
+				if (!workMeasuresResponse.isSuccessful()) {
+                    logError(workMeasuresResponse.getResponse(), workMeasuresResponse.getStatusCode(), workMeasuresSelfLink, workMeasuresJson);
+                    finalResult = false;
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to add new work measures (FTE, headcount) for PersonNumber " + data.getPersonNumber());
+				} else {
+					logger.info("Successfully added new work measures (FTE, headcount) for PersonNumber " + data.getPersonNumber());
+				}
+			}
+		}*/
+				//Get links
+				links = getLinks(data, effectiveDate);
+				url = links.get(0);
+				workRelationshipsLink = links.get(1);
+				assignmentsLink = links.get(2);
+
+				//Get Assignments SELF link
+				result = processAPI(assignmentsLink, "GET", null).getResponse();
+				currentAssignmentResponse = gson.fromJson(result, WorkersResponse.class);
+				String selfLink = currentAssignmentResponse.findLinkbyRel("self");
+				String assignmentId = currentAssignmentResponse.getItems().get(0).getAssignmentId();
+				String ActionCode = newAssignment.getActionCode();
+				String ReasonCode = newAssignment.getReasonCode();
+
+				// Add or correct assignment
+				//if(managersResponse.isSuccessful()){
+				ApiResponse assignmentResult;
+				String assignmentPayload;
+				if (isInternalHireUpdate && !isStartDateOrActionAdjustment) {
+					newAssignment.setActionCode(null);
+					newAssignment.setReasonCode(null);
+					assignmentPayload = gson.toJson(newAssignment);
+					//This is an update but the start date or action didn't change.  Correct the existing assignment
+					assignmentResult = processAPI(selfLink, "PATCH", assignmentPayload, true, "CORRECTION",effectiveDate,"4712-12-31");
+				} else{
+					//add new assignment
+					assignmentPayload = gson.toJson(newAssignment);
+					assignmentResult = processAPI(selfLink, "PATCH", assignmentPayload, true, "CORRECTION", effectiveDate,"4712-12-31");
+				}
+				if (!assignmentResult.isSuccessful()) {
+					// log error
+					logError(assignmentResult.getResponse(), assignmentResult.getStatusCode(), selfLink, assignmentPayload);
+					logger.info("Headers used: Start Date = " + effectiveDate );
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to add new assignment for PersonNumber " + data.getPersonNumber()+". Headers used: Start Date = " + effectiveDate);
+					finalResult = false;
+				} else {
+				    logger.info("Successfully added new assignment for PersonNumber " + data.getPersonNumber());
+		        }
+				
+				//Update LocationID
+				String BusUnit = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+				if(BusUnit == "PFG US"){
+					if(newAssignment.getWorkAtHomeFlag() && assignmentResult.isSuccessful()){
+						String payload = "{\"ActionCode\":\"" + ActionCode + "\"," + "\"ReasonCode\":\"" + ReasonCode + "\"," + "\"LocationId\":" +  "null," +
+								"\"WorkAtHomeFlag\":" +  "true}";
+						
+						ApiResponse LocResponse = processAPI(selfLink, "PATCH", payload, true, "UPDATE", effectiveDate,"4712-12-31");
+						if (!LocResponse.isSuccessful()) {
+							logger.info("Error correcting LocationId");
+							logError(LocResponse.getResponse(), LocResponse.getStatusCode(), selfLink, payload);
+							// Add Error Message Information here to use for Error Email
+							captureErrorMsgs.add("Error correcting LocationId");
+	
+							finalResult = false;
+						} else {
+							logger.info("Successfully corrected LocationId");
+						}
+					}
+				}
+		// Add/Correct contracts
+		if(contracts != null && assignmentResult.isSuccessful()){
+			Contracts contract = contracts.get(0);
+			String contractJson = gson.toJson(contract);
+			//get contracts link from workrelationships
+			String contractsLink = getApiLink("contracts", workRelationshipsLink);
+			if (contractsLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link contracts.");
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				finalResult = false;
+
+			}
+
+			String contractResult = processAPI(contractsLink, "GET", null).getResponse();
+			WorkersResponse contractLinkResponse = gson.fromJson(contractResult, WorkersResponse.class);
+			String contractSelfLink = contractLinkResponse.findLinkbyRel("self");
+
+			ApiResponse contractResponse ;
+			if(isInternalHireUpdate && contractLinkResponse.getCount() > 0 ){
+                String contractStartDt = contractLinkResponse.getEffectiveStartDate();
+                String contractEndDt = contractLinkResponse.getEffectiveEndDate();
+				contractResponse = processAPI(contractSelfLink,"PATCH",contractJson,true,"CORRECTION",contractStartDt,contractEndDt);
+			} else {
+				contractResponse = processAPI(contractsLink,"POST",contractJson,true,"UPDATE",effectiveDate);
+                //contractResponse = processAPI(contractSelfLink,"PATCH",contractJson,true,"UPDATE",effectiveDate);
+			}
+
+			if(!contractResponse.isSuccessful()){
+				logError(contractResponse.getResponse(), contractResponse.getStatusCode(), contractSelfLink, contractJson);
+				finalResult = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to correct contract information.");
+			} else {
+				logger.info("Successfully corrected contract info");
+			}
+		}
+
+		//update for external identifier
+		List<ExternalIdentifiers> externalIdentifiers = data.getPendingWorker().getExternalIdentifiers();
+		if(externalIdentifiers != null){
+			logger.info("Updating externalId");
+			boolean exIdSuccess = updateExternalIdentifier(data.getPendingWorker(), url, effectiveDate);
+			if(!exIdSuccess){
+				finalResult = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to update external ID.");
+			} else {
+				logger.info("Successfully updated external ID");
+			}
+		}
+		
+		//update salary
+			if(assignmentResult.isSuccessful()){
+				String dateString = startDate;
+				String salaryAmt = data.getSalary().getSalaryAmount();
+				String salaryBasisCode = getSalaryBasisCode(data, gradeId);
+				ArrayList<String> salDet = getSalaryId(assignmentId, salaryBasisCode, dateString);
+				String salaryId = "";
+				if(!salDet.isEmpty()){
+				salaryId = salDet.get(0);
+				dateString = salDet.get(1);
+				}
+				String salPayload = addSalary(assignmentId, salaryBasisCode, newAssignmentActionCode, dateString, salaryAmt);
+				if(!salPayload.isEmpty()){
+					if(salaryId.isEmpty()){
+							ApiResponse salResponse = processAPI(SALARY_API, "POST", salPayload);
+							if(!salResponse.isSuccessful()){
+								logger.info("Unable to add Salary");
+								logError(salResponse.getResponse(), salResponse.getStatusCode(), SALARY_API, salPayload);
+								// Add Error Message Information here to use for Error Email
+								captureErrorMsgs.add("Unable to add Salary");
+								finalResult = false;
+							}else{
+								logger.info("Salary added successfully");
+							}
+					}
+					else{
+						String updateUrl = SALARY_API + "/" + salaryId ;
+						ApiResponse salResponse = processAPI(updateUrl, "PATCH", salPayload, true, "UPDATE");
+						if(!salResponse.isSuccessful()){
+							logger.info("Unable to update Salary");
+							logError(salResponse.getResponse(), salResponse.getStatusCode(), updateUrl, salPayload);
+							// Add Error Message Information here to use for Error Email
+							captureErrorMsgs.add("Unable to update Salary");
+							finalResult = false;
+						}else{
+							logger.info("Salary updated successfully");
+						}
+					}	
+				}
+				else{
+				logger.info("Salary payload empty");
+				}
+			}
+
+		// Generate Error Email Message
+        if(!successful) {
+            String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(), errorMessage.getErrorMessageList(), data);
+        }
+
+        if(!finalResult) {
+            String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+            errorMessage.setApplicantId(applicantId);
+            errorMessage.setErrorMessageList(captureErrorMsgs);
+            sendErrorEmail(errorMessage.getApplicantId(), errorMessage.getErrorMessageList(), data);
+        }
+		return successful;
+	}
+
+	public WorkersResponse getFutureAssignment(String assignmentsLink) throws IOException {
+	    Gson gson = new Gson();
+        String futureAssign = processAPI(assignmentsLink + "?effectiveDate=4712-12-31","GET",null).getResponse();
+        WorkersResponse futureResponse = gson.fromJson(futureAssign, WorkersResponse.class);
+        futureResponse.setCurrentItemIndex();
+        return futureResponse;
+    }
+
+	public ArrayList<String> getLinks(ApiData data, String effectiveDate) throws IOException{
+
+		ArrayList<String> Links = new ArrayList<>();
+
+		// 1 Get work relationships link
+			String url = WORKERS_API + "?q=PersonNumber=" + data.getPersonNumber() + "&expand=workRelationships.assignments&effectiveDate=" + effectiveDate ;
+			String workRelationshipsLink = getApiLink("workRelationships", url);
+			if (workRelationshipsLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link workRelationships.");
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				//return false;
+
+			}
+
+			if(workRelationshipsLink.isEmpty()){
+			    logger.info("Unable to locate work relationships.  Can't process internal hire.");
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to locate work relationships.  Can't process internal hire.");
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			    //return false;
+	        }
+
+			// 2 Get Assignments link from WorkRelationships
+			String assignmentsLink = getApiLink("assignments", workRelationshipsLink);
+			if (assignmentsLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link assignments.");
+				// Generate Error Email Message
+				String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				//return false;
+
+			}
+
+		Links.add(url);
+		Links.add(workRelationshipsLink);
+		Links.add(assignmentsLink);
+
+		return Links;
+	}
+
+    public Date getDateFromString(String dateString){
+		Date date = null;
+		try {
+			date = dateFormat.parse(dateString);
+		}catch(ParseException | NullPointerException e){
+			e.printStackTrace();
+		}
+		return date;
+	}
+
+	public String getManagerAssignmentNumber(String managerPersonNumber) throws IOException {
+		Gson gson = new Gson();
+		String managerAssignmentNumber = "";
+		// 1 Get work relationships link
+		String url = WORKERS_API + "?q=PersonNumber=" + managerPersonNumber;
+		String workRelationshipsLink = getApiLink("workRelationships", url);
+
+		// 2 Get Assignments link from WorkRelationships
+		String assignmentsLink = getApiLink("assignments", workRelationshipsLink);
+
+		// 3 Get Assignments SELF link
+		String assignmentLinkJSON = processAPI(assignmentsLink, "GET", null).getResponse();
+		WorkersResponse managerAssignmentResponse = gson.fromJson(assignmentLinkJSON, WorkersResponse.class);
+		int currentAssignmentIndex = managerAssignmentResponse.getCurrentItemIndex();
+		managerAssignmentNumber = managerAssignmentResponse.getItems().get(currentAssignmentIndex).getAssignmentNumber();
+		return managerAssignmentNumber;
+	}
+
+
+    public boolean updatePersonalInfo(PendingWorker pw, String baseUrl, String mode, ApiData.Type workerType) throws IOException {
+		Gson gson = new Gson();
+		boolean finalResult1 = true;
+
+		String startDate = null;
+		switch(mode){
+			case "UPDATE":
+				startDate = pw.getWorkRelationships().get(0).getAssignments().get(0).getProjectedStartDate();
+				break;
+			case "CORRECTION":
+				//get dates from current elements
+				break;
+			default:
+				logger.info("Invalid mode.  Unable to update personal information");
+				return false;
+		}
+
+		//Update DateOfBirth
+		if (pw.getDateOfBirth()!= null && workerType != ApiData.Type.INTERNAL){
+            String dateOfBirth = gson.toJson(pw.getDateOfBirth());
+			String dateOfBirthJson = "{ \"DateOfBirth\": " + dateOfBirth  + "}";
+			String workerString = processAPI(baseUrl,"GET",null).getResponse();
+			WorkersResponse workersResponse = gson.fromJson(workerString, WorkersResponse.class);
+			String workerSelfUrl = workersResponse.findLinkbyRel("self");
+			if (workersResponse.getDateOfBirth()== null || !workersResponse.getDateOfBirth().equals(dateOfBirthJson)){
+				ApiResponse dobUpdate = processAPI(workerSelfUrl,"PATCH",dateOfBirthJson,true,"UPDATE" );
+				if (!dobUpdate.isSuccessful()){
+					logError(dobUpdate.getResponse(), dobUpdate.getStatusCode(), workerSelfUrl, dateOfBirthJson);
+					finalResult1 = false;
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to update DateOfBirth");
+				} else {
+					logger.info("DateOfBirth updated.");
+				}
+			}
+		}
+
+		// Update Name - New hire, rehire
+        List<Names> names = pw.getNames();
+		if (names != null  && workerType != ApiData.Type.INTERNAL) {
+            String namesJson = gson.toJson(names.get(0));
+			logger.info("Adding name");
+			String namesLink = getApiLink("names", baseUrl);
+			if (namesLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link names.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				finalResult1 = false;
+
+			}
+			String result1 = processAPI(namesLink,"GET",null).getResponse();
+			WorkersResponse namesResponse = gson.fromJson(result1,WorkersResponse.class);
+			String nameDetailsLink = namesResponse.findLinkbyRel("self");
+			ApiResponse namesResult = null ;
+			if(startDate!=null) {
+				//use the current date for new row
+				 namesResult = processAPI(nameDetailsLink, "PATCH", namesJson, "UPDATE", todayString);
+			} else {
+				String nameStartDt = namesResponse.getEffectiveStartDate();
+				String nameEndDt = namesResponse.getEffectiveEndDate();
+				namesResult = processAPI(nameDetailsLink, "PATCH", namesJson,true, "CORRECTION", nameStartDt,nameEndDt);
+			}
+			if (!namesResult.isSuccessful()) {
+				logError(namesResult.getResponse(), namesResult.getStatusCode(), nameDetailsLink, namesJson);
+				finalResult1 = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to update name.");
+			}
+		}
+		// Update home address - only one type, HOME - New hire, rehire
+        List<Addresses> addresses = pw.getAddresses();
+		if (addresses != null && workerType != ApiData.Type.INTERNAL ) {
+            String addressJson = gson.toJson(addresses.get(0));
+			logger.info("Adding address");
+			String addressLink = getApiLink("addresses", baseUrl);
+			if (addressLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link addresses.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				finalResult1 = false;
+
+			}
+			String result1 = processAPI(addressLink, "GET",null).getResponse();
+			WorkersResponse addressResponse = gson.fromJson(result1, WorkersResponse.class);
+
+			String addressDetailsLink = addressResponse.findLinkbyItemType("AddressType",pw.getAddresses().get(0).getAddressType());
+			//If no type found issue a POST, otherwise PATCH
+			ApiResponse addressResult = null;
+			if (addressDetailsLink == null){
+				addressResult = processAPI(addressLink, "POST", addressJson );
+			} else {
+				if(startDate!=null){
+					//Add new row using the current date
+					addressResult = processAPI(addressDetailsLink, "PATCH", addressJson, "UPDATE", todayString);
+				} else {
+					String addressStartDt = addressResponse.getEffectiveStartDate();
+					String addressEndDt = addressResponse.getEffectiveEndDate();
+					addressResult = processAPI(addressDetailsLink, "PATCH", addressJson, "CORRECTION", addressStartDt, addressEndDt);
+				}
+			}
+			if (!addressResult.isSuccessful()) {
+				logError(addressResult.getResponse(), addressResult.getStatusCode(), addressDetailsLink, addressJson);
+				finalResult1 = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to update home address.");
+			}
+		}
+		// Update phones - New hire, rehire
+        List<Phones> phones = pw.getPhones();
+		if (phones != null && workerType != ApiData.Type.INTERNAL ) {
+			logger.info("Adding phones");
+			String phonesLink = getApiLink("phones", baseUrl);
+			if (phonesLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link phones.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				finalResult1 = false;
+
+			}
+			for(Phones phone : pw.getPhones()) {
+				String thisPhoneJson = gson.toJson(phone);
+
+				String phoneResponse = processAPI(phonesLink,"GET", null).getResponse();
+				WorkersResponse workersResponse = gson.fromJson(phoneResponse, WorkersResponse.class);
+				String phoneDetailsLink = workersResponse.findLinkbyItemType("PhoneType", phone.getPhoneType());
+
+				ApiResponse phonesResult = null;
+				//If no type found issue a POST, otherwise PATCH
+				if(phoneDetailsLink == null ){
+					phonesResult = processAPI(phonesLink, "POST", thisPhoneJson, false);
+				} else {
+					phonesResult = processAPI(phoneDetailsLink, "PATCH", thisPhoneJson, false);
+				}
+				if (!phonesResult.isSuccessful()) {
+					logError(phonesResult.getResponse(), phonesResult.getStatusCode(), phoneDetailsLink, thisPhoneJson);
+					finalResult1 = false;
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to update phones.");
+				}
+			}
+		}
+		// Update email - only one type, H1 - New hire, rehire
+        List<Emails> emails = pw.getEmails();
+		if (emails != null && workerType != ApiData.Type.INTERNAL ) {
+			logger.info("Adding email");
+            String emailJson = gson.toJson(emails.get(0));
+			String emailLink = getApiLink("emails", baseUrl);
+			if (emailLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link emails.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				finalResult1 = false;
+
+			}
+
+			String emailResponse = processAPI(emailLink,"GET",null).getResponse();
+			WorkersResponse workersResponse = gson.fromJson(emailResponse, WorkersResponse.class);
+
+			String emailDetailsLink = workersResponse.findLinkbyItemType("EmailType", pw.getEmails().get(0).getEmailType());
+			//If no type found issue a POST, otherwise PATCH
+			ApiResponse emailResult = null;
+			if (emailDetailsLink == null){
+				emailResult = processAPI(emailLink, "POST", emailJson,false);
+			} else {
+				emailResult = processAPI(emailDetailsLink, "PATCH", emailJson,false);
+			}
+			if (!emailResult.isSuccessful()) {
+				logError(emailResult.getResponse(), emailResult.getStatusCode(), emailDetailsLink, emailJson);
+				finalResult1 = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to update email.");
+			}
+		}
+
+		//Gender (legislative info) - New hire, rehire
+		if(pw.getLegislativeInfo() != null && workerType != ApiData.Type.INTERNAL ){
+			String legislativeInfoJson = gson.toJson(pw.getLegislativeInfo().get(0));
+			logger.info("Adding legislative info");
+			String legislativeLink = getApiLink("legislativeInfo", baseUrl);
+			if (legislativeLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link legislativeInfo.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				finalResult1 = false;
+
+			}
+			String legislationCode = pw.getLegislativeInfo().get(0).getLegislationCode();
+            String legislativeResponse = processAPI(legislativeLink + "?q=LegislationCode='" + legislationCode + "'", "GET", null).getResponse();
+            WorkersResponse legislativeWR = gson.fromJson(legislativeResponse, WorkersResponse.class);
+            String legislativeDetailsLink = legislativeWR.findLinkbyRel("self");
+
+			ApiResponse legislativeInfoResponse = null;
+			if (legislativeDetailsLink == null){
+				legislativeInfoResponse = processAPI(legislativeLink, "POST", legislativeInfoJson,false);
+			} else {
+				if (startDate != null) {
+					legislativeInfoResponse = processAPI(legislativeDetailsLink, "PATCH", legislativeInfoJson, true, "UPDATE", todayString);
+				} else {
+					String legislativeStartDt = legislativeWR.getEffectiveStartDate();
+					String legislativeEndDt = legislativeWR.getEffectiveEndDate();
+					legislativeInfoResponse = processAPI(legislativeDetailsLink, "PATCH", legislativeInfoJson, true, "CORRECTION", legislativeStartDt,legislativeEndDt );
+				}
+			}
+			if (!legislativeInfoResponse.isSuccessful()) {
+				logError(legislativeInfoResponse.getResponse(), legislativeInfoResponse.getStatusCode(), legislativeDetailsLink, legislativeInfoJson);
+				finalResult1 = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to add legislative info.");
+			} else {
+				logger.info("Successfully added legislative info");
+			}
+		}
+
+		//National ID - New hire, rehire, internal hire
+		if(pw.getNationalIdentifiers()!= null && workerType != ApiData.Type.INTERNAL){
+			String nationalIdJson = gson.toJson(pw.getNationalIdentifiers().get(0));
+			logger.info("Adding national id info");
+			String nationalIdLink = getApiLink("nationalIdentifiers", baseUrl);
+			if (nationalIdLink.isEmpty()){
+				captureErrorMsgs.add("No results found when searching for link nationalIdentifiers.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				finalResult1 = false;
+
+			}
+			String nationalIdDetails = processAPI(nationalIdLink,"GET",null).getResponse();
+			WorkersResponse nationalIdWR = gson.fromJson(nationalIdDetails, WorkersResponse.class);
+			String nationalIdDetailsLink = nationalIdWR.findLinkbyItemType("NationalIdentifierType", pw.getNationalIdentifiers().get(0).getNationalIdentifierType());
+
+			ApiResponse nationalIdResponse = null;
+			if(nationalIdDetailsLink == null){
+				nationalIdResponse = processAPI(nationalIdLink, "POST", nationalIdJson);
+			} else {
+				nationalIdResponse = processAPI(nationalIdDetailsLink, "PATCH", nationalIdJson, false);
+			}
+			if(!nationalIdResponse.isSuccessful()){
+				logError(nationalIdResponse.getResponse(), nationalIdResponse.getStatusCode(), nationalIdDetailsLink, nationalIdJson);
+				finalResult1 = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to add national ID info.");
+			} else {
+				logger.info("Successfully added national ID info");
+			}
+		}
+		
+		//Driver License - New Hire, Rehire
+		/*		if (pw.getDriverLicenses() != null && workerType != ApiData.Type.INTERNAL) {
+					String driverLicenseJson = gson.toJson(pw.getDriverLicenses().get(0));
+					logger.info("Adding Driver License Info");
+					String driverLicenseLink = getApiLink("driverLicenses",baseUrl);
+					if(driverLicenseLink.isEmpty()){
+						captureErrorMsgs.add("No results found when searching for link driverLicenses.");
+						errorMessage.setErrorMessageList(captureErrorMsgs);
+						finalResult1 = false;
+					}
+					String driverLicenseDetails = processAPI(driverLicenseLink,"GET",null).getResponse();
+					WorkersResponse driverLicenseWR = gson.fromJson(driverLicenseDetails, WorkersResponse.class);
+					String driverLicenseDetailsLink = driverLicenseWR.findLinkbyItemType("LicenseType",pw.getDriverLicenses().get(0).getLicenseType());
+
+					ApiResponse driverLicenseResponse;
+					if(driverLicenseDetailsLink == null){
+						driverLicenseResponse = processAPI(driverLicenseLink, "POST",driverLicenseJson);
+					}
+					else{
+						driverLicenseResponse = processAPI(driverLicenseDetailsLink,"PATCH",driverLicenseJson,false);
+					}
+					if(!driverLicenseResponse.isSuccessful()){
+						logError(driverLicenseResponse.getResponse(),driverLicenseResponse.getStatusCode(),driverLicenseDetailsLink,driverLicenseJson);
+						finalResult1 = false;
+						//Adding Error Message Information here to use for Error Email
+						captureErrorMsgs.add("Unable to add drivers License info.");
+					}else{
+						logger.info("Successfully added drivers license info");
+					}
+				}*/
+
+		//update for external identifier - New hire, rehire, internal hire
+        List<ExternalIdentifiers> externalIdentifiers = pw.getExternalIdentifiers();
+		if(externalIdentifiers != null){
+            //String externalIdJson = gson.toJson(externalIdentifiers.get(0));
+			logger.info("Updating externalId");
+			boolean exIdSuccess = updateExternalIdentifier(pw, baseUrl, startDate);
+			if(!exIdSuccess){
+				finalResult1 = false;
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to update external ID.");
+			} else {
+				logger.info("Successfully updated external ID");
+			}
+		}
+
+		// Generate Error Email Message
+		errorMessage.setErrorMessageList(captureErrorMsgs);
+
+
+		return finalResult1;
+	}
+
+	public boolean updateExternalIdentifier(PendingWorker worker, String urlIn, String startDateString ) throws IOException {
+		Gson gson = new Gson();
+		ExternalIdentifiers externalId = worker.getExternalIdentifiers().get(0);
+
+		String identifiersLink = getApiLink("externalIdentifiers", urlIn);
+		if (identifiersLink.isEmpty()){
+			captureErrorMsgs.add("No results found when searching for link externalIdentifiers.");
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			return false;
+
+		}
+		String identifiersResponse = processAPI(identifiersLink,"GET",null).getResponse();
+		WorkersResponse response1 = gson.fromJson(identifiersResponse, WorkersResponse.class);
+
+		String identifiersDetails = response1.findLinkbyItemType("ExternalIdentifierType", worker.getExternalIdentifiers().get(0).getExternalIdentifierType());
+		ApiResponse identifiersResult = null;
+
+        String externalIdJson;
+		if(identifiersDetails == null){
+            externalId.setFromDate(startDateString);
+            externalIdJson = gson.toJson(externalId);
+			identifiersResult = processAPI(identifiersLink, "POST",externalIdJson, false);
+		} else {
+            externalIdJson = gson.toJson(externalId);
+			identifiersResult = processAPI(identifiersDetails, "PATCH", externalIdJson, false );
+		}
+		if (!identifiersResult.isSuccessful()) {
+			logError(identifiersResult.getResponse(), identifiersResult.getStatusCode(), identifiersDetails, externalIdJson);
+		}
+		return identifiersResult.isSuccessful();
+	}
+
+	public void logError(String response, int responseCode, String url, String payload) {
+		if (response.isEmpty()) {
+			response = "No response";
+		}
+		logger.info("Error: " + response + System.getProperty("line.separator") + "Response Code: " + responseCode
+				+ System.getProperty("line.separator") + "Target URL: " + url + System.getProperty("line.separator") + "JSON Payload: " + payload);
+
+	}
+
+	public String getSalaryBasisCode(ApiData data, Long GradeId) throws IOException{
+		String Code = "";
+		String Frequency = data.getSalary().getSalFrequency();
+		String BusUnit = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+
+		switch(BusUnit){
+			case "PFG US":
+				Code = getSalBasisUS(GradeId, Frequency);
+				break;
+			default:
+				Code = data.getSalary().getSalaryBasisCode();
+				break;
+		}
+		return Code;
+	}
+
+	public String getSalBasisUS(Long GradeId, String Frequency) throws IOException{
+		String Code = "";
+		String GradeCode = "";
+
+		Gson gson = new Gson();
+		String gradeIdUrl = GRADE_API + "?q=GradeId='" + GradeId +"'";
+		WorkersResponse gradeIdResponse = gson.fromJson(processAPI(gradeIdUrl,"GET",null).getResponse(), WorkersResponse.class);
+		if (gradeIdResponse.getItems().isEmpty()) {
+			logger.warning("There are no gradeIdResponse Items.");
+		}
+		else{
+			GradeCode = gradeIdResponse.getItems().get(0).getGradeCode();
+		}
+
+		int len = GradeCode.length();
+		char grade = GradeCode.charAt(len-3);
+		boolean flag = false;
+		if(grade=='A'){
+			int count = Integer.parseInt(GradeCode.substring(len-2, len));
+			for(int i=13;i<22;i++){
+				if(count==i){
+					flag = true;
+					break;
+				}
+			}
+		}
+
+		switch(Frequency.toLowerCase()){
+		case "hourly" :
+			if(flag && grade=='A'){
+				Code = "PFG_Hourly_Geo_Adjustable_USA";
+			}
+			else
+			{
+				Code =  "PFG_Hourly_National_USA";
+			}
+			break;
+		case "annual" :
+			if(flag && grade=='A'){
+				Code = "PFG_Annual_Geo_Adjustable_USA";
+			}
+			else
+			{
+				Code = "PFG_Annual_National_USA";
+			}
+			break;
+		default :
+			logger.info("Provide valid salary frequency");
+			break;
+		}
+		return Code;
+
+	}
+
+	public String addSalary(String assignmentId, String salaryCode, String actionCode, String dateString, String salaryAmt) throws IOException {
+		// 1. Get SalaryBasisID
+		String salBasisUrl = SALARYBASIS_API + "?q=Code=" + "'" + salaryCode + "'";
+		String salBasisResponse = processAPI(salBasisUrl,"GET",null).getResponse();
+		String salBasisId = getElementValue("SalaryBasisID",salBasisResponse);
+
+		// 2. Get ActionId
+		String actionUrl = ACTION_API + "?q=ActionCode=" + "'" + actionCode + "'";
+		String actionResponse = processAPI(actionUrl,"GET",null).getResponse();
+		String actionId = getElementValue("ActionID",actionResponse);
+		System.out.println(actionId);
+		
+		 String json = "{\"AssignmentId\":" + assignmentId + ","
+		 + "\"SalaryBasisId\":" + salBasisId + ","
+		 + "\"DateFrom\":" + "\"" + dateString + "\"" + ","
+		 + "\"SalaryAmount\":" + salaryAmt + ","
+		 + "\"ActionId\":" + actionId
+		 + "}";
+
+		 System.out.println(json);
+		 
+		return json;
+	}
+	
+	public String getElementValue(String linkName , String response){
+		Gson gson = new Gson();
+		String ID = "";
+		if(linkName.equals("SalaryBasisID"))
+		{
+			SalBasisResponse salBasisResponse = gson.fromJson(response, SalBasisResponse.class);
+			if (!salBasisResponse.getItems().isEmpty()) {
+				ID = salBasisResponse.getItems().get(0).getSalaryBasisId();
+			} else {
+				logger.warning("There are no SalBasisResponse Items.");
+			}
+		}
+		else if(linkName.equals("ActionID"))
+		{
+			ActionResponse actResponse = gson.fromJson(response, ActionResponse.class);
+			if (!actResponse.getItems().isEmpty()) {
+				ID = actResponse.getItems().get(0).getActionId();
+			} else {
+				logger.warning("There are no ActionResponse Items.");
+			}
+		}
+		return ID;
+	}
+
+	public ArrayList<String> getSalaryId(String assignmentId, String salaryCode, String startDate) throws IOException {
+		Gson gson = new Gson();
+		
+		String salaryId = "";
+		String startDt = "";
+		ArrayList<String> SalDet = new ArrayList<String>();
+		DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+		//Get the current salary (based on max DateFrom): if start dates match then return the Salary ID to process an update.
+		// If Start Date is in past then don't return a value - this will trigger a POST
+		String salaryUrl = SALARY_API + "?q=AssignmentId=" + assignmentId + " and DateTo='4712-12-31' and Code='" + salaryCode +"'";
+		Salary salaryResponse = gson.fromJson(processAPI(salaryUrl,"GET",null).getResponse(),Salary.class);
+		if (salaryResponse != null && salaryResponse.getCount() > 0) {
+			Date existingDateTo = getDateFromString(salaryResponse.getItems().get(0).getDateFrom());
+			Date newSalaryStartDate = getDateFromString(startDate);
+			//Date sysDate = getDateFromString(getSysDate());
+			if (newSalaryStartDate.equals(existingDateTo)) {
+				salaryId = salaryResponse.getItems().get(0).getSalaryId();
+				startDt = dateFormat.format(existingDateTo);
+				SalDet.add(salaryId);
+				SalDet.add(startDt);
+			}
+			else if (newSalaryStartDate.before(existingDateTo)){
+				salaryId = salaryResponse.getItems().get(0).getSalaryId();
+				startDt = dateFormat.format(existingDateTo);
+				SalDet.add(salaryId);
+				SalDet.add(startDt);
+			}
+			logger.info("SalID : " + salaryId);
+			logger.info("Start : " + startDt);
+		}
+		return SalDet;
+	}
+	
+	public static String getSysDate(){
+		Date date = new Date();
+		DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+		String SysDate = dateFormat.format(date);
+		
+		return SysDate;
+	}
+	
+	public void sendErrorEmail(String applicantId, ArrayList<String> errorList,ApiData dataType){
+
+		String fileName = null;
+		String personNum = dataType.getPersonNumber();
+		String BU = dataType.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+		String DOJ = dataType.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getProjectedStartDate();
+		String JobCode = dataType.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getJobCode();
+		switch(dataType.getType()){
+			case NEWHIRE:
+				fileName = "ICIMS_HCM_WORKER.csv";
+				break;
+			case REHIRE:
+				fileName = "ICIMS_HCM_REHIRE.csv"; 
+				break;
+			case INTERNAL:
+				fileName = "ICIMS_HCM_INT_HIRE.csv";
+				break;
+		}
+
+		EmailUtility.generateErrorEmail(applicantId, errorList, fileName, personNum, BU, DOJ, JobCode);
+	}
+
+	public Long getGradeId (String jobCode) throws IOException {
+		Gson gson = new Gson();
+		String jobCodeUrl = JOB_API + "?q=JobCode='" + jobCode +"'";
+		System.out.println(jobCodeUrl);
+		String validGradesLink = getApiLink("validGrades", jobCodeUrl);
+		System.out.println(validGradesLink);
+		if(validGradesLink.isEmpty()){
+			logger.warning("There are no validGrades.");
+			throw new IOException("No valid grades found for job code " + jobCode);
+		}
+		WorkersResponse gradeResponse = gson.fromJson(processAPI(validGradesLink,"GET",null).getResponse(), WorkersResponse.class);
+		if (gradeResponse.getItems().isEmpty()) {
+			logger.warning("There are no gradeResponse Items.");
+			throw new IOException("Unable to retrieve grade details from " + validGradesLink);
+		}
+		Long gradeId = gradeResponse.getItems().get(0).getGradeId();
+
+		
+		System.out.println(gradeId);
+		return gradeId;
+	}
+	private boolean addDisability(String personNum, String SDT, ApiData data) throws IOException {
+		Gson gson = new Gson();
+		boolean success = false;
+		String startDate = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getProjectedStartDate();
+		String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+
+		String json = "{\"LegislationCode\":" + "\"US\","
+		 + "\"Category\":" + "\"NA\","
+		 + "\"QuotaFTE\":" + "\"1\","
+		 + "\"Status\":" +  "\"A\","
+		 + "\"SelfDisclosedType\":\"" + SDT + "\""
+		 + "}";
+
+		String url = WORKERS_API + "?q=PersonNumber=" + personNum;
+		String disabilityLink = getApiLink("disabilities", url);
+
+		WorkersResponse disabilityResponse = gson.fromJson(processAPI(disabilityLink,"GET",null).getResponse(), WorkersResponse.class);
+		if(disabilityResponse.getItems().isEmpty()){
+			ApiResponse disResponse = processAPI(disabilityLink, "POST", json);
+			if (!disResponse.isSuccessful()){
+				logError(disResponse.getResponse(), disResponse.getStatusCode(), disabilityLink, json);
+				// Add Error Message Information here to use for Error Email
+				errorMessage.setApplicantId(applicantId);
+				captureErrorMsgs.add("Unable to add disabilities.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			}else{ 
+				success = true;
+				logger.info("Successfully added disabilites");
+			}
+		}
+		else if(!disabilityResponse.getItems().isEmpty()){
+			String disSelfLink = getApiLink("self", disabilityLink);
+			ApiResponse disResponse = processAPI(disSelfLink, "PATCH", json, true, "UPDATE", startDate, "4712-12-31");
+			if (!disResponse.isSuccessful()){
+				logError(disResponse.getResponse(), disResponse.getStatusCode(), disSelfLink, json);
+				// Add Error Message Information here to use for Error Email
+				errorMessage.setApplicantId(applicantId);
+				captureErrorMsgs.add("Unable to update disabilities.");
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			}else{ 
+				success = true;
+				logger.info("Successfully updated disabilites");
+			}
+		}
+		return success;
+	}
+}
