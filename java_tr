@@ -1,1 +1,2144 @@
-hello
+package com.principal.hireprocess;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.logging.FileHandler;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
+
+import com.principal.hireprocess.domain.*;
+import com.principal.hireprocess.domain.Assignments.assignmentsDFF;
+import com.principal.hireprocess.domain.Ethnicities.Disabilities;
+import com.principal.hireprocess.domain.LegislativeInfo.LegislativeInfoDDF;
+import com.principal.hireprocess.domain.WorkRelationships.workRelationshipsDFF;
+
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+
+public class Main {
+
+//	private static final String CSV_FILE_PATH = File.separator + "infa" + File.separator + "datafiles" + File.separator + "CSS" + File.separator+ "TgtFiles" + File.separator + "HR" + File.separator + "ICIMS" + File.separator;
+	private static final String[] fileNames = { "ICIMS_HCM_WORKER.csv", "ICIMS_HCM_REHIRE.csv", "ICIMS_HCM_INT_HIRE.csv" };
+	private static final String CSV_FILE_PATH = "C:\\infa\\datafiles\\";
+//	private static final String LOG_FILE_PATH = File.separator + "infa" + File.separator + "datafiles" + File.separator + "CSS" + File.separator + "TgtFiles" + File.separator + "HR" + File.separator + "ICIMS" + File.separator + "logs";
+	private static final String LOG_FILE_PATH = "C:\\infa\\datafiles\\logs";
+
+
+	/**
+	 * @param args - Takes one argument to indicate the environment.
+	 *               Should be one of the following values:
+	 *               	"LOCAL": when running the program on a local machine. Connects to HCM Test
+	 *               	"INFAPCT1": Informatica Test - provided dynamically by Informatica workflow. Connects to HCM Dev
+	 *               	"INFAPCQ1": Informatica Pilot - provided dynamically by Informatica workflow. Connects to HCM Test
+	 *               	"INFAPCP1"/"INFAPCP2": Informatica Prod - provided dynamically by Informatica workflow. Connects to HCM Prod
+	 */
+	public static void main(String[] args) {
+
+		Logger logger = Logger.getLogger("HCMLoader");
+		FileHandler fileHandler;
+		try {
+			DateFormat dateFormat =  new SimpleDateFormat("yyyyMMddHHmmss");
+			String dateTimeString = dateFormat.format(Calendar.getInstance().getTime());
+			fileHandler = new FileHandler(LOG_FILE_PATH + File.separator + "HCMConnector_" + dateTimeString + ".log");
+			logger.addHandler(fileHandler);
+			SimpleFormatter sf = new SimpleFormatter();
+			fileHandler.setFormatter(sf);
+			logger.info("Starting HCMLoader");
+			logger.info("Creating HireSuccess.csv file");
+            if(!SuccessUtility.printHeader())
+            {
+            	logger.info("Error occured while creating HireSuccess.csv file");
+            }
+		} catch (IOException e) {
+			e.printStackTrace();
+			// Create Error Handling Objects
+			ErrorMessage errorMessage = new ErrorMessage();
+			errorMessage.setErrorMessage("Could not Start HCMLoader process: error encountered while creating log file");
+			// Generate Error Email
+			sendGenericErrorEmail(errorMessage.getErrorMessage());
+			return;
+		}
+
+		if (args.length != 1){
+			String message = "Please provide the environment the program is running in.  Valid values are \"LOCAL\",\"INFAPCT1\",\"INFAPCQ1\", \"INFAPCP1\", and \"INFAPCP2\" ";
+			logger.info(message);
+			ErrorMessage errorMessage = new ErrorMessage();
+			errorMessage.setErrorMessage(message);
+			// Generate Error Email
+			sendGenericErrorEmail(errorMessage.getErrorMessage());
+			return;
+		} else {
+            /* Set HCM environment to connect to based on where the program is running */
+			Common.Environment env;
+            switch(args[0].toUpperCase(Locale.ENGLISH)){
+            	//Informatica Test
+				case "INFAPCT1":
+					env	= Common.Environment.DEV;
+					break;
+				//Informatica Pilot Or running Jar locally
+				case "INFAPCQ1":
+				case "LOCAL":
+					env	= Common.Environment.TEST;
+					break;
+				//Informatica Prod
+				case "INFAPCP1":
+				case "INFAPCP2":
+					env	= Common.Environment.PROD;
+					break;
+				default:
+					String msg = "Abort - " + args[0] + " is an invalid environment. Valid values are \"LOCAL\",\"INFAPCT1\",\"INFAPCQ1\", \"INFAPCP1\", and \"INFAPCP2\" ";
+					logger.info(msg);
+					ErrorMessage errorMessage = new ErrorMessage();
+					errorMessage.setErrorMessage(msg);
+					// Generate Error Email
+					sendGenericErrorEmail(errorMessage.getErrorMessage());
+					return;
+			}
+			Common common = Common.getInstance();
+			common.setEnvironment(env);
+			logger.info("Setting parameters for HCM " + env.name() + " environment.");
+		}
+		serializePendingWorkerObject();
+	}
+
+	public static void sendToHCM(ApiData data) {
+
+		// Create Error Handling Objects
+		ErrorMessage errorMessage = new ErrorMessage();
+		ArrayList<String> captureErrorMsgs = new ArrayList<>();
+
+		Logger logger = Logger.getLogger("HCMLoader");
+		String applicantId = data.getPendingWorker().getExternalIdentifiers().get(0).getExternalIdentifierNumber();
+		String startDateString = data.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getProjectedStartDate();
+		//abort if no start date
+		if(startDateString.isEmpty()){
+            logger.info("No start date found for applicant = " + applicantId + ". Unable to process.");
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("No start date found for applicant = " + applicantId + ". Unable to process.");
+			// Generate Error Email Message
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+            return;
+        }
+        //abort if start date prior to today
+        SimpleDateFormat dateFormat =  new SimpleDateFormat("yyyy-MM-dd");
+        String todayString = dateFormat.format(Calendar.getInstance().getTime());
+        Date todayDate;
+        Date startDate;
+        try{
+            todayDate = dateFormat.parse(todayString);
+            startDate = dateFormat.parse(startDateString);
+        } catch (ParseException e){
+            logger.info("Error parsing date, unable to process record for applicant " + applicantId);
+			// Add Error Message Information here to use for Error Email
+            captureErrorMsgs.add("Error parsing date, unable to process record for applicant " + applicantId);
+			// Generate Error Email Message
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+            return;
+        }
+        if (startDate.before(todayDate)){
+            logger.info("Start date cannot be in the past.  Unable to process record for applicant " + applicantId);
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("Start date cannot be in the past.  Unable to process record for applicant " + applicantId);
+			// Generate Error Email Message
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+            return;
+        }
+
+		HCMConnector connector = new HCMConnector();
+		// Send data to HCM
+		boolean successful = false;
+		try {
+			switch (data.getType()) {
+			case NEWHIRE:
+                logger.info("Adding new pending worker: iCIMS Applicant ID = " + applicantId);
+                successful = connector.createPendingWorker(data);
+				break;
+			case REHIRE:
+				logger.info("Adding rehire: Person Number = " + data.getPersonNumber());
+				successful = connector.rehire(data);
+				break;
+			case INTERNAL:
+				// process internal applicant
+				logger.info("Adding new internal applicant: " + data.getPersonNumber());
+				successful = connector.internalHire(data);
+				break;
+			default:
+				logger.info("Unable to determine type of hire. Record not processed for applicant " + applicantId);
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("Unable to determine type of hire. Record not processed for applicant " + applicantId);
+				// Generate Error Email Message
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				break;
+			}
+		} catch (Exception e) {
+            logger.severe("Fatal error encountered: " + e.getMessage());
+			e.printStackTrace();
+			// Add Error Message Information here to use for Error Email
+			captureErrorMsgs.add("SEVERE: Fatal error encountered: " + e.getMessage());
+			// Generate Error Email Message
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			errorMessage.setApplicantId(applicantId);
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+		}
+		if(successful){
+			logger.info("Transaction successfully processed.");
+			/*Update icims workflow*/
+			String workflowId = data.getWorkflowId();
+			if(!workflowId.isEmpty()) {
+				ICIMSConnector icimsConnector = new ICIMSConnector();
+				//Verify data before updating iCIMS if running in non-prod environment
+				if(Common.getInstance().getEnvironment()!= Common.Environment.PROD){
+					boolean isTestData = icimsConnector.isTestWorkflow(applicantId,workflowId);
+					if(!isTestData){
+						logger.info("Unable to verify test data.  Skipping iCIMS workflow update.");
+						return;
+					} else {
+						logger.info("Verified test data - updating iCIMS workflow status.");
+					}
+				}
+				ApiResponse icimsResponse = icimsConnector.updateIcimsWorkflowStatus(workflowId);
+				if (icimsResponse.isSuccessful()) {
+					logger.info("Successfully updated iCIMS worfklow for applicant " + applicantId);
+				} else {
+					logger.info("Unable to update iCIMS worfklow for applicant " + applicantId);
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Unable to update iCIMS worfklow for applicant " + applicantId);
+					logger.info("Status code = " + icimsResponse.getStatusCode());
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Status code = " + icimsResponse.getStatusCode());
+					logger.info("Response = " + icimsResponse.getResponse());
+					// Add Error Message Information here to use for Error Email
+					captureErrorMsgs.add("Response = " + icimsResponse.getResponse());
+					// Generate Error Email Message
+					errorMessage.setErrorMessageList(captureErrorMsgs);
+					errorMessage.setApplicantId(applicantId);
+					errorMessage.setErrorMessageList(captureErrorMsgs);
+					sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+				}
+			} else {
+				logger.info("WorkflowId not found for applicant " + applicantId);
+				// Add Error Message Information here to use for Error Email
+				captureErrorMsgs.add("WorkflowId not found for applicant " + applicantId);
+				// Generate Error Email Message
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				errorMessage.setApplicantId(applicantId);
+				errorMessage.setErrorMessageList(captureErrorMsgs);
+				sendHCMErrorEmail(errorMessage.getApplicantId(),errorMessage.getErrorMessageList(),data);
+			}
+		}
+	}
+
+	private static void serializePendingWorkerObject() {
+		Logger logger = Logger.getLogger("HCMLoader");
+
+		for (String fileName : fileNames) {
+			String thisFile = CSV_FILE_PATH + fileName;
+			File file = new File(thisFile);
+			if (file.isFile()) {
+				logger.info("Processing file " + fileName);
+				List<ApiData> data = new ArrayList<>();
+
+				if (fileName.equals("ICIMS_HCM_WORKER.csv")) {
+					data = newHireFile(thisFile); // newHire, reHire,
+													// internalHire
+				} else if (fileName.equals("ICIMS_HCM_REHIRE.csv")) {
+					data = reHireFile(thisFile);
+				} else if (fileName.equals("ICIMS_HCM_INT_HIRE.csv")) {
+					data = internalHireFile(thisFile);
+				}
+				for (ApiData thisData : data) {
+					switch (fileName) {
+					case "ICIMS_HCM_WORKER.csv":
+						thisData.setType(ApiData.Type.NEWHIRE);
+						break;
+					case "ICIMS_HCM_REHIRE.csv":
+						thisData.setType(ApiData.Type.REHIRE);
+						break;
+					case "ICIMS_HCM_INT_HIRE.csv":
+						thisData.setType(ApiData.Type.INTERNAL);
+						break;
+					}
+                    sendToHCM(thisData);
+				}
+			}
+            logger.info("Finished processing for " + fileName);
+
+		}
+	}
+
+	private static List<ApiData> newHireFile(String filePath) {
+		// Create Error Handling Objects
+		ErrorMessage errorMessage = new ErrorMessage();
+		ArrayList<String> captureErrorMsgs = new ArrayList<>();
+
+		// Create a list to hold the pending worker information that will be
+		// used for the json.
+		// List<PendingWorker>pendingWorkerList = new
+		// ArrayList<PendingWorker>();
+		List<ApiData> data = new ArrayList<>();
+		Logger logger = Logger.getLogger("HCMLoader");
+
+		// Read the CSV File
+		try (Reader reader = Files.newBufferedReader(Paths.get(filePath));
+				CSVParser csvParser = new CSVParser(reader,
+						CSVFormat.RFC4180.withFirstRecordAsHeader().withDelimiter('|').withIgnoreHeaderCase().withTrim()) // .DEFAULT.withFirstRecordAsHeader().withIgnoreHeaderCase().withTrim());
+		) {
+
+			// Retrieve all the records from the file at once into memory
+			Iterable<CSVRecord> csvRecords = csvParser.getRecords();
+
+			// test Record Read
+			// System.out.println(csvRecords);
+
+			// Loop through the CSV Records
+			for (CSVRecord csvRecord : csvRecords) {
+
+				// Get Pending Worker Data records into Pending Worker memory
+				// object
+				PendingWorker pendingWorker = new PendingWorker();
+
+				/**** ADDRESSES ****/
+
+				// Create Address array list to hold the different type of
+				// addresses.
+				ArrayList<Addresses> addressesArrayList = new ArrayList<>();
+
+				if (csvRecord.get("Home_AddressLine1") != null && csvRecord.get("Home_AddressLine1").length() > 0) {
+
+					// Create Address object for Home Addresses
+					Addresses addresses = new Addresses();
+					addresses.setAddressLine1(csvRecord.get("Home_AddressLine1"));
+					if (csvRecord.get("Home_AddressLine2") != null && csvRecord.get("Home_AddressLine2").length() > 0) {
+						addresses.setAddressLine2(csvRecord.get("Home_AddressLine2"));
+					}
+					addresses.setAddressType(csvRecord.get("Home_AddressType"));
+					addresses.setCountry(csvRecord.get("Home_Country"));
+					addresses.setPostalCode(csvRecord.get("Home_PostalCode"));
+					addresses.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("Home_PrimaryFlag").toLowerCase()));
+					addresses.setRegion1(csvRecord.get("Home_Region1"));
+					if (csvRecord.get("Home_Region2") != null && csvRecord.get("Home_Region2").length() > 0) {
+						addresses.setRegion2(csvRecord.get("Home_Region2"));
+					}
+					if (csvRecord.get("Home_Region3") != null && csvRecord.get("Home_Region3").length() > 0) {
+						addresses.setRegion3(csvRecord.get("Home_Region3"));
+					}
+					addresses.setTownOrCity(csvRecord.get("Home_TownOrCity"));
+					if (csvRecord.get("Home_FloorNumber") != null && csvRecord.get("Home_FloorNumber").length() > 0) {
+						addresses.setFloorNumber(csvRecord.get("Home_FloorNumber"));
+					}
+					if (csvRecord.get("Home_Building") != null && csvRecord.get("Home_Building").length() > 0) {
+						addresses.setBuilding(csvRecord.get("Home_Building"));
+					}
+
+					// Add Addresses to AddressArray list
+					addressesArrayList.add(addresses);
+
+				}
+				
+				if (csvRecord.get("DateOfBirth") != null && csvRecord.get("DateOfBirth").length() > 0) {
+					
+					pendingWorker.setDateOfBirth(csvRecord.get("DateOfBirth"));
+				}
+				
+				if (csvRecord.get("RegionOfBirth") != null && csvRecord.get("RegionOfBirth").length() > 0) {
+					
+					pendingWorker.setRegionOfBirth(csvRecord.get("RegionOfBirth"));
+				}
+
+				if (csvRecord.get("TownOfBirth") != null && csvRecord.get("TownOfBirth").length() > 0) {
+	
+					pendingWorker.setTownOfBirth(csvRecord.get("TownOfBirth"));
+				}
+
+				/**** EMAILS ****/
+
+				// Create emails array list to hold the email addresses
+				ArrayList<Emails> emailsArrayList = new ArrayList<Emails>();
+
+				if (csvRecord.get("Home_EmailAddress") != null && csvRecord.get("Home_EmailAddress").length() > 0) {
+					// Get email data records into Emails memory object
+					Emails emails_1 = new Emails(csvRecord.get("Home_EmailType"), csvRecord.get("Home_EmailAddress"),
+							Boolean.parseBoolean(csvRecord.get("Home_PrimaryFlag1").toLowerCase()));
+
+					// Add emails to the array list
+					emailsArrayList.add(emails_1);
+				}
+				
+				/**** SALARY ****/
+
+				// Create salary array list to hold the salary details
+				ArrayList<Salary> salaryArrayList = new ArrayList<Salary>();
+				
+				Salary salary = new Salary();
+				if (csvRecord.get("SalaryAmount") != null && csvRecord.get("SalaryAmount").length() > 0) {
+					salary.setSalaryAmount(csvRecord.get("SalaryAmount"));
+				}
+				if (csvRecord.get("SalaryBasisCode") != null && csvRecord.get("SalaryBasisCode").length() > 0) {
+					salary.setSalaryBasisCode(csvRecord.get("SalaryBasisCode"));
+				}
+				if (csvRecord.get("SalaryActionCode") != null && csvRecord.get("SalaryActionCode").length() > 0) {
+					salary.setSalaryActionCode(csvRecord.get("SalaryActionCode"));
+				}
+				if (csvRecord.get("SalFrequency") != null && csvRecord.get("SalFrequency").length() > 0) {
+					salary.setSalFrequency(csvRecord.get("SalFrequency"));
+				}
+				//Add salary details to array list
+				salaryArrayList.add(salary);
+				
+				/**** EXTERNAL IDENTIFIERS ****/
+
+				// Create ExternalIdentifiers array list to hold the different
+				// type of external identifiers.
+				ArrayList<ExternalIdentifiers> externalIdentifiersArrayList = new ArrayList<>();
+				// Create ExternalIdentifier object for external identifiers
+				ExternalIdentifiers externalIdentifiers = new ExternalIdentifiers();
+				if (csvRecord.get("ExternalIdentifierNumber") != null && csvRecord.get("ExternalIdentifierNumber").length() > 0) {
+					externalIdentifiers.setExternalIdentifierNumber(csvRecord.get("ExternalIdentifierNumber"));
+				}
+				if (csvRecord.get("ExternalIdentifierType") != null && csvRecord.get("ExternalIdentifierType").length() > 0) {
+					externalIdentifiers.setExternalIdentifierType(csvRecord.get("ExternalIdentifierType"));
+				}
+				if (csvRecord.get("FromDate") != null && csvRecord.get("FromDate").length() > 0) {
+					externalIdentifiers.setFromDate(csvRecord.get("FromDate"));
+				}
+
+				// Add external identifiers to the array list.
+				externalIdentifiersArrayList.add(externalIdentifiers);
+
+				/**** LEGISLATIVE INFO ****/
+
+				// Create Legislative Info array list to hold the different
+				// types of legislative info
+				ArrayList<LegislativeInfo> legislativeInfoArrayList = new ArrayList<>();
+                // Create LegislativeInfo Object for legislative info
+                LegislativeInfo legislativeInfo = new LegislativeInfo();
+                if (csvRecord.get("LegislationCode1") != null && csvRecord.get("LegislationCode1").length() > 0) {
+                    legislativeInfo.setLegislationCode1(csvRecord.get("LegislationCode1"));
+                }
+                if (csvRecord.get("Gender") != null && csvRecord.get("Gender").length() > 0) {
+                    legislativeInfo.setGender(csvRecord.get("Gender"));
+                }
+                if (csvRecord.get("HighestEducationLevel") != null && csvRecord.get("HighestEducationLevel").length() > 0) {
+                    legislativeInfo.setHighestEducationLevel(csvRecord.get("HighestEducationLevel"));
+                }
+                if (csvRecord.get("MaritalStatus") != null && csvRecord.get("MaritalStatus").length() > 0) {
+                    legislativeInfo.setMaritalStatus(csvRecord.get("MaritalStatus"));
+                }
+
+					LegislativeInfoDDF legislativeInfoDDF = legislativeInfo.new LegislativeInfoDDF();
+
+
+				if (csvRecord.get("Veteran") != null && csvRecord.get("Veteran").length() > 0) {
+
+					ArrayList<LegislativeInfoDDF> legislativeInfoDDFArrayList = new ArrayList<>();
+
+					if (csvRecord.get("__FLEX_Context") != null && csvRecord.get("__FLEX_Context").length() > 0) {
+						legislativeInfoDDF.set__FLEX_Context("US");
+						legislativeInfoDDF.setVeteranSelfIdentification(csvRecord.get("Veteran"));
+
+					}
+
+					legislativeInfoDDFArrayList.add(legislativeInfoDDF);
+					if (!legislativeInfoDDFArrayList.isEmpty()){
+						legislativeInfo.setLegislativeInfoDDF(legislativeInfoDDFArrayList);
+					}
+				}
+
+				if(csvRecord.get("Gender").length() > 0  || csvRecord.get("Veteran").length() > 0 || csvRecord.get("HighestEducationLevel").length() > 0 ){
+					// Add LegislativeInfo to the array list
+					legislativeInfoArrayList.add(legislativeInfo);
+				}
+
+					/**** ETHNICITIES ****/
+
+					ArrayList<Ethnicities> EthnicitiesList = new ArrayList<Ethnicities>();
+					Ethnicities ethnicities = new Ethnicities();
+					if(csvRecord.get("Race") != null && csvRecord.get("Race").length() > 0) {
+
+						if (csvRecord.get("RaceLegislationCode") != null && csvRecord.get("RaceLegislationCode").length() > 0) {
+							ethnicities.setLegislationCode(csvRecord.get("RaceLegislationCode"));
+						}
+						if (csvRecord.get("RacePrimaryFlag") != null && csvRecord.get("RacePrimaryFlag").length() > 0) {
+							ethnicities.setPrimaryFlag(Boolean.valueOf(csvRecord.get("RacePrimaryFlag")));
+						}
+
+						ethnicities.setEthnicity(csvRecord.get("Race"));
+
+						EthnicitiesList.add(ethnicities);
+					}
+
+					ArrayList<Disabilities> DisabilitiesList = new ArrayList<Disabilities>();
+					Disabilities disabilities = ethnicities.new Disabilities();
+					if (csvRecord.get("Disability") != null && csvRecord.get("Disability").length() > 0) {
+						disabilities.setSelfDisclosedType(csvRecord.get("Disability"));
+						
+						DisabilitiesList.add(disabilities);
+					}
+
+				/**** NAMES ****/
+
+				// Create names array list to hold the name combinations
+				ArrayList<Names> namesArrayList = new ArrayList<Names>();
+
+				if (csvRecord.get("FirstName") != null && csvRecord.get("FirstName").length() > 0 && csvRecord.get("LastName") != null
+						&& csvRecord.get("LastName").length() > 0) {
+					// Get names data records into Names memory object
+					Names names = new Names();
+
+					names.setLastName(csvRecord.get("LastName"));
+					names.setFirstName(csvRecord.get("FirstName"));
+					if (csvRecord.get("MiddleNames") != null && csvRecord.get("MiddleNames").length() > 0) {
+						names.setMiddleNames(csvRecord.get("MiddleNames"));
+					}
+					if (csvRecord.get("LegislationCode2") != null && csvRecord.get("LegislationCode2").length() > 0) {
+						names.setLegislationCode2(csvRecord.get("LegislationCode2"));
+					}
+					if (csvRecord.get("Suffix") != null && csvRecord.get("Suffix").length() > 0) {
+						names.setSuffix(csvRecord.get("Suffix"));
+					}
+					if ((csvRecord.get("KnownAs") != null && csvRecord.get("KnownAs").length() > 0)) {
+						names.setKnownAs(csvRecord.get("KnownAs"));
+					}
+					if (csvRecord.get("NameInformation15") != null && csvRecord.get("NameInformation15").length() > 0) {
+						names.setNameInformation15(csvRecord.get("NameInformation15"));
+					}
+					if ((csvRecord.get("formerlastname") != null && csvRecord.get("formerlastname").length() > 0)) {
+						names.setPreviousLastName(csvRecord.get("formerlastname"));
+					}
+					
+					// Add names to the names array list
+					namesArrayList.add(names);
+				}
+
+				/**** DRIVER LICENSE INFO ****/
+				//Create Drivers License array list to hold the drivers license information
+				ArrayList<DriverLicenses> driverLicensesArrayList = new ArrayList<>();
+
+				if(csvRecord.get("DriverLicenseNumber") != null && csvRecord.get("DriverLicenseNumber").length() > 0){
+					//Get Drivers License Information into the DriverLicenseInfo memory object
+					DriverLicenses driverLicenseInfo = new DriverLicenses();
+
+					driverLicenseInfo.setLicenseNumber(csvRecord.get("DriverLicenseNumber"));
+
+					if(csvRecord.get("DriverLicenseState") != null && csvRecord.get("DriverLicenseState").length() > 0){
+						driverLicenseInfo.setIssuingLocation(csvRecord.get("DriverLicenseState"));
+					}
+
+					if(csvRecord.get("DriverLicenseCountry") != null && csvRecord.get("DriverLicenseCountry").length() > 0){
+						driverLicenseInfo.setIssuingCountry(csvRecord.get("DriverLicenseCountry"));
+					}
+
+					if(csvRecord.get("LicenseType") != null && csvRecord.get("LicenseType").length()>0){
+						driverLicenseInfo.setLicenseType(csvRecord.get("LicenseType"));
+					}
+
+					//Add drivers license information to the drivers license array list
+					driverLicensesArrayList.add(driverLicenseInfo);
+				}
+
+				
+				/**** NATIONAL IDENTIFIERS ****/
+				
+				ArrayList<NationalIdentifiers> nationalIdentifiersList = new ArrayList<NationalIdentifiers>();
+				NationalIdentifiers nationalIdentifier = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber") != null && csvRecord.get("NationalIdentifierNumber").length() > 0) {
+					nationalIdentifier.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType") != null && csvRecord.get("NationalIdentifierType").length() > 0) {
+						nationalIdentifier.setNationalIdentifierType(csvRecord.get("NationalIdentifierType"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag") != null && csvRecord.get("NationalIdentifierPrimaryFlag").length() > 0) {
+						nationalIdentifier.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier);
+				}
+				
+				NationalIdentifiers nationalIdentifier1 = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber1") != null && csvRecord.get("NationalIdentifierNumber1").length() > 0) {
+					nationalIdentifier1.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber1"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier1.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType1") != null && csvRecord.get("NationalIdentifierType1").length() > 0) {
+						nationalIdentifier1.setNationalIdentifierType(csvRecord.get("NationalIdentifierType1"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag1") != null && csvRecord.get("NationalIdentifierPrimaryFlag1").length() > 0) {
+						nationalIdentifier1.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag1")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier1);
+				}
+				
+				NationalIdentifiers nationalIdentifier2 = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber2") != null && csvRecord.get("NationalIdentifierNumber2").length() > 0) {
+					nationalIdentifier2.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber2"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier2.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType2") != null && csvRecord.get("NationalIdentifierType2").length() > 0) {
+						nationalIdentifier2.setNationalIdentifierType(csvRecord.get("NationalIdentifierType2"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag2") != null && csvRecord.get("NationalIdentifierPrimaryFlag2").length() > 0) {
+						nationalIdentifier2.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag2")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier2);
+				}
+				
+				/**** PHONES ****/
+
+				// Create Phones array list to hold the different types of
+				// phones
+				ArrayList<Phones> phonesArrayList = new ArrayList<>();
+
+				if (csvRecord.get("Home_PhoneType") != null && csvRecord.get("Home_PhoneType").length() > 0
+						&& csvRecord.get("Home_PhoneNumber") != null && csvRecord.get("Home_PhoneNumber").length() > 0) {
+					// Create Phones Object for the home phone records
+					Phones homePhones = new Phones();
+
+					homePhones.setPhoneType(csvRecord.get("Home_PhoneType"));
+					homePhones.setPhoneNumber(csvRecord.get("Home_PhoneNumber"));
+
+					if (csvRecord.get("Home_LegislationCode") != null && csvRecord.get("Home_LegislationCode").length() > 0) {
+						homePhones.setLegislationCode(csvRecord.get("Home_LegislationCode"));
+					}
+
+					if (csvRecord.get("Home_AreaCode") != null && csvRecord.get("Home_AreaCode").length() > 0) {
+						homePhones.setAreaCode(csvRecord.get("Home_AreaCode"));
+					}
+					if (csvRecord.get("Home_CountryCodeNumber") != null && csvRecord.get("Home_CountryCodeNumber").length() > 0) {
+						homePhones.setCountryCodeNumber(csvRecord.get("Home_CountryCodeNumber"));
+					}
+					if (csvRecord.get("Home_PrimaryFlag3") != null && !csvRecord.get("Home_PrimaryFlag3").isEmpty()) {
+						homePhones.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("Home_PrimaryFlag3")));
+					}
+
+					// Add phones to array list
+					phonesArrayList.add(homePhones);
+
+				}
+
+				// Create Phones Object for the work phone records
+				if (csvRecord.get("Work_PhoneType") != null && csvRecord.get("Work_PhoneType").length() > 0
+						&& csvRecord.get("Work_PhoneNumber") != null && csvRecord.get("Work_PhoneNumber").length() > 0) {
+					// Create Phones Object for the work phone records
+					Phones workPhones = new Phones();
+
+					workPhones.setPhoneType(csvRecord.get("Work_PhoneType"));
+					workPhones.setPhoneNumber(csvRecord.get("Work_PhoneNumber"));
+
+					if (csvRecord.get("Work_LegislationCode") != null && csvRecord.get("Work_LegislationCode").length() > 0) {
+						workPhones.setLegislationCode(csvRecord.get("Work_LegislationCode"));
+					}
+
+					if (csvRecord.get("Work_AreaCode") != null && csvRecord.get("Work_AreaCode").length() > 0) {
+						workPhones.setAreaCode(csvRecord.get("Work_AreaCode"));
+					}
+					if (csvRecord.get("Work_CountryCodeNumber") != null && csvRecord.get("Work_CountryCodeNumber").length() > 0) {
+						workPhones.setCountryCodeNumber(csvRecord.get("Work_CountryCodeNumber"));
+					}
+					if (csvRecord.get("Work_PrimaryFlag") != null && !csvRecord.get("Work_PrimaryFlag").isEmpty()) {
+						workPhones.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("Work_PrimaryFlag")));
+					}
+
+					// Add phones to array list
+					phonesArrayList.add(workPhones);
+
+				}
+				
+				if (csvRecord.get("Mobile_PhoneType") != null && csvRecord.get("Mobile_PhoneType").length() > 0 && 
+						csvRecord.get("Mobile_PhoneNumber") != null
+						&& csvRecord.get("Mobile_PhoneNumber").length() > 0) {
+					// Create Phones Object for the work phone records
+					Phones mobilePhones = new Phones();
+
+					mobilePhones.setPhoneType(csvRecord.get("Mobile_PhoneType"));
+					mobilePhones.setPhoneNumber(csvRecord.get("Mobile_PhoneNumber"));
+
+					if (csvRecord.get("Mobile_LegislationCode") != null && csvRecord.get("Mobile_LegislationCode").length() > 0) {
+						mobilePhones.setLegislationCode(csvRecord.get("Mobile_LegislationCode"));
+					}
+
+					if (csvRecord.get("Mobile_AreaCode") != null && csvRecord.get("Mobile_AreaCode").length() > 0) {
+						mobilePhones.setAreaCode(csvRecord.get("Mobile_AreaCode"));
+					}
+					if (csvRecord.get("Mobile_CountryCodeNumber") != null && csvRecord.get("Mobile_CountryCodeNumber").length() > 0) {
+						mobilePhones.setCountryCodeNumber(csvRecord.get("Mobile_CountryCodeNumber"));
+					}
+					if (csvRecord.get("Mobile_PrimaryFlag") != null && !csvRecord.get("Mobile_PrimaryFlag").isEmpty()) {
+						mobilePhones.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("Mobile_PrimaryFlag")));
+					}
+
+					// Add phones to array list
+					phonesArrayList.add(mobilePhones);
+
+				}
+
+				/**** WORK RELATIONSHIPS ****/
+
+				// Create work relationships array list to hold the work
+				// relationships
+				ArrayList<WorkRelationships> workRelationshipsArrayList = new ArrayList<WorkRelationships>();
+				// Get work relationships data records into WorkRelationships
+				// memory object
+				WorkRelationships workRelationships = new WorkRelationships();
+
+				if (csvRecord.get("LegalEmployerName") != null && csvRecord.get("LegalEmployerName").length() > 0) {
+					workRelationships.setLegalEmployerName(csvRecord.get("LegalEmployerName"));
+				}
+				if (csvRecord.get("WorkerType") != null && csvRecord.get("WorkerType").length() > 0) {
+					workRelationships.setWorkerType(csvRecord.get("WorkerType"));
+				}
+				if (csvRecord.get("ReadyToConvertFlag") != null && csvRecord.get("ReadyToConvertFlag").length() > 0) {
+					workRelationships.setReadyToConvertFlag(Boolean.parseBoolean(csvRecord.get("ReadyToConvertFlag")));
+				}
+				if (csvRecord.get("PrimaryFlag") != null && csvRecord.get("PrimaryFlag").length() > 0) {
+					workRelationships.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("PrimaryFlag")));
+				}
+
+				if (csvRecord.isMapped("ContractType") && !csvRecord.get("ContractType").isEmpty()) {
+					ArrayList<Contracts> contractList = new ArrayList<>();
+					Contracts contract = new Contracts();
+
+					contract.setContractType(csvRecord.get("ContractType"));
+					if (!csvRecord.get("ContractEndDate").isEmpty()) {
+						contract.setContractEndDate(csvRecord.get("ContractEndDate"));
+					}
+					contractList.add(contract);
+					workRelationships.setContracts(contractList);
+				}
+				ArrayList<workRelationshipsDFF> workRelationshipsDFFArrayList = new ArrayList<>();
+				workRelationshipsDFF workDFF = workRelationships.new workRelationshipsDFF();
+				if (csvRecord.get("__FLEX_Context1") != null && csvRecord.get("__FLEX_Context1").length() > 0) {
+					workDFF.set__FLEX_Context(csvRecord.get("__FLEX_Context1"));
+
+
+				workRelationshipsDFFArrayList.add(workDFF);
+				}
+				if (!workRelationshipsDFFArrayList.isEmpty()){
+					workRelationships.setWorkRelationshipsDFF(workRelationshipsDFFArrayList);
+				}
+
+
+				// Add workrelationships to the workrelationships array list
+				workRelationshipsArrayList.add(workRelationships);
+
+				/**** ASSIGNMENTS ****/
+
+				// Create assignments array list to hold the assignments
+				ArrayList<Assignments> assignmentsArrayList = new ArrayList<Assignments>();
+				// Get assignments data records into Asignments memory object
+				Assignments assignments = new Assignments();
+
+				if (csvRecord.get("BusinessUnitName") != null && csvRecord.get("BusinessUnitName").length() > 0) {
+					assignments.setBusinessUnitName(csvRecord.get("BusinessUnitName"));
+				}
+				if (csvRecord.get("ActionCode") != null && csvRecord.get("ActionCode").length() > 0) {
+					assignments.setActionCode(csvRecord.get("ActionCode"));
+				}
+				if (csvRecord.get("ActionReason") != null && csvRecord.get("ActionReason").length() > 0) {
+					assignments.setReasonCode(csvRecord.get("ActionReason"));
+				}
+				if (csvRecord.get("AssignmentCategory") != null && csvRecord.get("AssignmentCategory").length() > 0) {
+					assignments.setAssignmentCategory(csvRecord.get("AssignmentCategory"));
+				}
+				if (csvRecord.get("ProjectedStartDate") != null && csvRecord.get("ProjectedStartDate").length() > 0) {
+					assignments.setProjectedStartDate(csvRecord.get("ProjectedStartDate"));
+				}
+				if (csvRecord.get("ProposedUserPersonType") != null && csvRecord.get("ProposedUserPersonType").length() > 0) {
+					assignments.setProposedUserPersonType(csvRecord.get("ProposedUserPersonType"));
+				}
+				if (csvRecord.get("JobCode") != null && csvRecord.get("JobCode").length() > 0) {
+					assignments.setJobCode(csvRecord.get("JobCode"));
+				}
+				if (csvRecord.get("DepartmentName") != null && csvRecord.get("DepartmentName").length() > 0) {
+					assignments.setDepartmentName(csvRecord.get("DepartmentName"));
+				}
+				if (csvRecord.get("LocationId") != null && csvRecord.get("LocationId").length() > 0) {
+					assignments.setLocationId(csvRecord.get("LocationId"));
+				}
+				if (csvRecord.get("WorkAtHomeFlag") != null && !csvRecord.get("WorkAtHomeFlag").isEmpty()) {
+					assignments.setWorkAtHomeFlag(Boolean.parseBoolean(csvRecord.get("WorkAtHomeFlag")));
+				}
+				if (csvRecord.get("PermanentTemporary") != null && csvRecord.get("PermanentTemporary").length() > 0) {
+					assignments.setPermanentTemporary(csvRecord.get("PermanentTemporary"));
+				}
+				if (csvRecord.get("FullPartTime") != null && csvRecord.get("FullPartTime").length() > 0) {
+					assignments.setFullPartTime(csvRecord.get("FullPartTime"));
+				}
+				if (csvRecord.get("ManagerFlag") != null && !csvRecord.get("ManagerFlag").isEmpty()) {
+					assignments.setManagerFlag(Boolean.parseBoolean(csvRecord.get("ManagerFlag")));
+				}
+				if (csvRecord.get("NormalHours") != null && csvRecord.get("NormalHours").length() > 0) {
+					assignments.setNormalHours(Double.valueOf(csvRecord.get("NormalHours")));
+				}
+				if (csvRecord.get("Frequency") != null && csvRecord.get("Frequency").length() > 0) {
+					assignments.setFrequency(csvRecord.get("Frequency"));
+				}
+
+
+				if (csvRecord.isMapped("ProbationPeriod") && !csvRecord.get("ProbationPeriod").isEmpty()) {
+					assignments.setProbationPeriod(Integer.parseInt(csvRecord.get("ProbationPeriod")));
+					if (csvRecord.isMapped("ProbationPeriodUnit") && !csvRecord.get("ProbationPeriodUnit").isEmpty()) {
+						assignments.setProbationPeriodUnit(csvRecord.get("ProbationPeriodUnit"));
+					}
+				}
+				if (csvRecord.get("WorkerCategory") != null && csvRecord.get("WorkerCategory").length() > 0) {
+					assignments.setWorkerCategory(csvRecord.get("WorkerCategory"));
+				}
+
+				ArrayList<assignmentsDFF> assignmentsDFFArrayList = new ArrayList<>();
+				assignmentsDFF assignDFF = assignments.new assignmentsDFF();
+				if (csvRecord.get("__FLEX_Context") != null && csvRecord.get("__FLEX_Context").length() > 0) {
+					if (csvRecord.get("pfgPayGroup") != null && csvRecord.get("pfgPayGroup").length() > 0) {
+						assignDFF.setPfgPayGroup(csvRecord.get("pfgPayGroup"));
+					}
+					assignDFF.set__FLEX_Context(csvRecord.get("__FLEX_Context"));
+					
+					if (csvRecord.get("pfgPiclBenefits") != null && csvRecord.get("pfgPiclBenefits").length() > 0) {
+						assignDFF.setPfgPiclBenefits(csvRecord.get("pfgPiclBenefits"));
+					}
+					
+					if (csvRecord.get("pfgGerencia") != null && csvRecord.get("pfgGerencia").length() > 0) {
+						assignDFF.setPfgGerencia(csvRecord.get("pfgGerencia"));
+					}
+
+				assignmentsDFFArrayList.add(assignDFF);
+				}
+				if (!assignmentsDFFArrayList.isEmpty()){
+					assignments.setAssignmentsDFF(assignmentsDFFArrayList);
+				}
+
+//				if (csvRecord.get("GradeCode") != null && csvRecord.get("GradeCode").length() > 0) {
+//					assignments.setGradeCode(csvRecord.get("GradeCode"));
+//				}
+				/*if (csvRecord.get("GradeName") != null && csvRecord.get("GradeName").length() > 0) {
+					assignments.setGradeName(csvRecord.get("GradeName"));
+				}*/
+
+					// Add assignments to the assignments array list
+				assignmentsArrayList.add(assignments);
+
+				/**** MANAGERS ****/
+
+				// Create managers array list to hold the managers
+				ArrayList<Managers> managersArrayList = new ArrayList<Managers>();
+				// Get managers data records into Managers memory object
+				if (csvRecord.isMapped("ManagerPersonNumber") && csvRecord.get("ManagerPersonNumber").length() > 0) {
+					Managers managers = new Managers();
+					managers.setPersonNumber(csvRecord.get("ManagerPersonNumber"));
+
+					if (csvRecord.get("ManagerType") != null && csvRecord.get("ManagerType").length() > 0) {
+						managers.setManagerType(csvRecord.get("ManagerType"));
+					}
+
+					// Add managers to the managers array list
+					managersArrayList.add(managers);
+				}
+
+				/**** WORK MEASURES ****/
+				// Create work measures array list
+				ArrayList<WorkMeasures> workMeasuresArrayList = new ArrayList<WorkMeasures>();
+				if (csvRecord.get("FTE_Value") != null && csvRecord.get("FTE_Value").length()>0) {
+					// Get Work Measures FTE data records into Work Measures memory object
+					WorkMeasures workMeasuresFTE = new WorkMeasures();
+
+					workMeasuresFTE.setValue(Double.valueOf(csvRecord.get("FTE_Value")));
+
+					if(csvRecord.get("FTE_Unit") != null && csvRecord.get("FTE_Unit").length()>0){
+						workMeasuresFTE.setUnit(csvRecord.get("FTE_Unit"));
+					}
+
+					// Add workMeasuresFTE to workMeasuresArrayList
+					workMeasuresArrayList.add(workMeasuresFTE);
+
+					// Get Work Measures FTE data records into Work Measures memory object
+					WorkMeasures workMeasuresHEAD = new WorkMeasures();
+
+					if(csvRecord.get("HEAD_Value") != null && csvRecord.get("HEAD_Value").length()>0){
+						workMeasuresHEAD.setValue(Double.valueOf(csvRecord.get("HEAD_Value")));
+					}
+					if(csvRecord.get("HEAD_Unit") != null && csvRecord.get("HEAD_Unit").length()>0){
+						workMeasuresHEAD.setUnit(csvRecord.get("HEAD_Unit"));
+					}
+
+					// Add workMeasuresHEAD data to workMeasuresArrayList
+					workMeasuresArrayList.add(workMeasuresHEAD);
+
+				}
+				
+				/**** CITIZENSHIPS ****/
+
+				// Create citizenships array list to hold the citizenship info
+				ArrayList<Citizenships> citizenshipsArrayList = new ArrayList<Citizenships>();
+				// Get citizenship data into Citizenships memory object
+				if (csvRecord.isMapped("Citizenship") && csvRecord.get("Citizenship").length() > 0) {
+					Citizenships citizenship = new Citizenships();
+					citizenship.setCitizenship(csvRecord.get("Citizenship"));
+
+					citizenship.setCitizenshipStatus("A");
+
+					// Add citizenship to the citizenships array list
+					citizenshipsArrayList.add(citizenship);
+				}
+
+				/**** ADD Data to Array Lists in Objects ****/
+
+				// Will embed the objects arrays inside WorkRelationship and
+				// Assigments/Managers objects
+				if (!managersArrayList.isEmpty()) {
+					assignments.setManagers(managersArrayList);
+				}
+				//Assignments/WorkMeasures object
+				if (!workMeasuresArrayList.isEmpty()){
+					assignments.setWorkMeasures(workMeasuresArrayList);
+				}
+
+
+				workRelationships.setAssignments(assignmentsArrayList);
+
+
+
+				// Add ArrayLists content to the Pending Worker memory object.
+				// If they are empty, then it will not add them.
+				if (!addressesArrayList.isEmpty()) {
+					pendingWorker.setAddresses(addressesArrayList);
+				}
+				if (!emailsArrayList.isEmpty()) {
+					pendingWorker.setEmailsArrayList(emailsArrayList);
+				}
+				if (!externalIdentifiersArrayList.isEmpty()) {
+					pendingWorker.setExternalIdentifiers(externalIdentifiersArrayList);
+				}
+				if (!legislativeInfoArrayList.isEmpty()) {
+					pendingWorker.setLegislativeInfo(legislativeInfoArrayList);
+				}
+				if (!namesArrayList.isEmpty()) {
+					pendingWorker.setNamesArrayList(namesArrayList);
+				}
+				if (!driverLicensesArrayList.isEmpty()){
+					pendingWorker.setDriverLicenseArrayList(driverLicensesArrayList);
+				}
+				if (!phonesArrayList.isEmpty()) {
+					pendingWorker.setPhones(phonesArrayList);
+				}
+				
+				if(!nationalIdentifiersList.isEmpty()){
+					pendingWorker.setNationalIdentifiers(nationalIdentifiersList);
+				}
+				pendingWorker.setWorkRelationshipsArrayList(workRelationshipsArrayList);
+
+				if(!EthnicitiesList.isEmpty()){
+					pendingWorker.setEthnicities(EthnicitiesList);
+				}
+				
+				if(!DisabilitiesList.isEmpty()){
+					pendingWorker.setDisabilities(DisabilitiesList);
+				}
+				
+				if(!citizenshipsArrayList.isEmpty()){
+					pendingWorker.setCitizenships(citizenshipsArrayList);
+				}
+				// Add all the pending worker information into the pending
+				// worker list.
+				// pendingWorkerList.add(pendingWorker);
+
+				/** Get PersonNumber **/
+				String personNumber = "";
+				if (csvRecord.isMapped("PersonNumber") && !csvRecord.get("PersonNumber").isEmpty()) {
+					personNumber = csvRecord.get("PersonNumber");
+				}
+
+				/** Get WorkflowId **/
+				String workflowId = "";
+				if (csvRecord.isMapped("WorkflowID") && !csvRecord.get("WorkflowID").isEmpty()) {
+					workflowId = csvRecord.get("WorkflowID");
+				}
+				String currentRelationship = "";
+				if(csvRecord.isMapped("RelationshipType") && !csvRecord.get("RelationshipType").isEmpty()){
+					currentRelationship = csvRecord.get("RelationshipType");
+				}
+
+				data.add(new ApiData(personNumber, pendingWorker, workflowId, currentRelationship, salary));
+			}
+
+		} catch (IOException e) {
+			logger.severe("IOException: " + e.getMessage() + e.toString());
+			captureErrorMsgs.add("SEVERE: Error Processing New Hire file: ("+e.getMessage()+e.toString()+")");
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			// Generate Error Email
+			sendGenericErrorEmail(errorMessage.getErrorMessage());
+		} catch (Exception e) {
+			logger.info(e.getMessage());
+			System.out.println(e.getMessage());
+			captureErrorMsgs.add("Error Processing New Hire file: ("+e.getMessage()+e.toString()+")");
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			// Generate Error Email
+			sendGenericErrorEmail(errorMessage.getErrorMessage());
+		}
+		finally {
+			logger.info("Done reading file!");
+		}
+
+		return data;
+	}
+
+	private static List<ApiData> reHireFile(String filePath) {
+		// Create Error Handling Objects
+		ErrorMessage errorMessage = new ErrorMessage();
+		ArrayList<String> captureErrorMsgs = new ArrayList<>();
+
+		// Create a list to hold the pending worker information that will be
+		// used for the json.
+		// List<ReHire> reHireWorkerList = new ArrayList<ReHire>();
+		List<ApiData> data = new ArrayList<>();
+		Logger logger = Logger.getLogger("HCMLoader");
+
+		// Read the CSV File
+		try (Reader reader = Files.newBufferedReader(Paths.get(filePath));
+				CSVParser csvParser = new CSVParser(reader,
+						CSVFormat.RFC4180.withFirstRecordAsHeader().withDelimiter('|').withIgnoreHeaderCase().withTrim()) // .DEFAULT.withFirstRecordAsHeader().withIgnoreHeaderCase().withTrim());
+		) {
+
+			// Retrieve all the records from the file at once into memory
+			Iterable<CSVRecord> csvRecords = csvParser.getRecords();
+
+			// test Record Read
+			// System.out.println(csvRecords);
+
+			// Loop through the CSV Records
+			for (CSVRecord csvRecord : csvRecords) {
+
+				// Get ReHire Worker Data records into ReHire memory object
+				PendingWorker reHireWorker = new PendingWorker();
+				
+				if (csvRecord.get("DateOfBirth") != null && csvRecord.get("DateOfBirth").length() > 0) {
+					
+					reHireWorker.setDateOfBirth(csvRecord.get("DateOfBirth"));
+				}
+				
+				if (csvRecord.get("RegionOfBirth") != null && csvRecord.get("RegionOfBirth").length() > 0) {
+					
+					reHireWorker.setRegionOfBirth(csvRecord.get("RegionOfBirth"));
+				}
+
+				if (csvRecord.get("TownOfBirth") != null && csvRecord.get("TownOfBirth").length() > 0) {
+	
+					reHireWorker.setTownOfBirth(csvRecord.get("TownOfBirth"));
+				}
+
+				/**** ADDRESSES ****/
+
+				// Create Address array list to hold the different type of
+				// addresses.
+				ArrayList<Addresses> addressesArrayList = new ArrayList<>();
+
+				if (csvRecord.get("HomeAddressLine1") != null && csvRecord.get("HomeAddressLine1").length() > 0) {
+
+					// Create Address object for Home Addresses
+					Addresses addresses = new Addresses();
+					addresses.setAddressLine1(csvRecord.get("HomeAddressLine1"));
+					if (csvRecord.get("HomeAddressLine2") != null && csvRecord.get("HomeAddressLine2").length() > 0) {
+						addresses.setAddressLine2(csvRecord.get("HomeAddressLine2"));
+					}
+					addresses.setAddressType(csvRecord.get("HomeAddressType"));
+					addresses.setCountry(csvRecord.get("HomeCountry"));
+					addresses.setPostalCode(csvRecord.get("HomePostalCode"));
+					addresses.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("HomePrimaryFlag").toLowerCase()));
+					addresses.setRegion1(csvRecord.get("HomeRegion1"));
+					if (csvRecord.get("HomeRegion2") != null && csvRecord.get("HomeRegion2").length() > 0) {
+						addresses.setRegion2(csvRecord.get("HomeRegion2"));
+					}
+					if (csvRecord.get("HomeRegion3") != null && csvRecord.get("HomeRegion3").length() > 0) {
+						addresses.setRegion3(csvRecord.get("HomeRegion3"));
+					}	
+					addresses.setTownOrCity(csvRecord.get("HomeTownOrCity"));
+					if (csvRecord.get("Home_FloorNumber") != null && csvRecord.get("Home_FloorNumber").length() > 0) {
+						addresses.setFloorNumber(csvRecord.get("Home_FloorNumber"));
+					}
+					if (csvRecord.get("Home_Building") != null && csvRecord.get("Home_Building").length() > 0) {
+						addresses.setBuilding(csvRecord.get("Home_Building"));
+					}
+
+					// Add Addresses to AddressArray list
+					addressesArrayList.add(addresses);
+
+					// Create Address Object for Second List of addresses
+					/*
+					 * if (csvRecord.get("AddressLine11") != null &&
+					 * csvRecord.get("AddressLine11").length() > 0) { // Create
+					 * Address Object for Mail addresses Addresses addressesMail
+					 * = new Addresses();
+					 * 
+					 * addressesMail.setAddressLine1(csvRecord.get(
+					 * "AddressLine11")); if (csvRecord.get("AddressLine21") !=
+					 * null && csvRecord.get("AddressLine21").length() > 0) {
+					 * addressesMail.setAddressLine2(csvRecord.get(
+					 * "AddressLine21")); }
+					 * addressesMail.setAddressType(csvRecord.get("AddressType1"
+					 * )); addressesMail.setCountry(csvRecord.get("Country1"));
+					 * addressesMail.setPrimaryFlag(Boolean.parseBoolean(
+					 * csvRecord.get("PrimaryFlag1").toLowerCase()));
+					 * addressesMail.setRegion1(csvRecord.get("Region11"));
+					 * if(csvRecord.get("Region21") != null &&
+					 * csvRecord.get("Region21").length()>0) {
+					 * addressesMail.setRegion2(csvRecord.get("Region21")); }
+					 * if(csvRecord.get("Region3") != null &&
+					 * csvRecord.get("Region3").length()>0) {
+					 * addressesMail.setRegion3(csvRecord.get("Region3")); }
+					 * addressesMail.setTownOrCity(csvRecord.get("TownOrCity1"))
+					 * ;
+					 * 
+					 * 
+					 * // Add addressMail object to the array list
+					 * addressesArrayList.add(addressesMail);
+					 * 
+					 * }
+					 */
+				}
+
+				/**** EMAILS ****/
+
+				// Create emails array list to hold the email addresses
+				ArrayList<Emails> emailsArrayList = new ArrayList<Emails>();
+
+				if (csvRecord.get("HomeEmailAddress") != null && csvRecord.get("HomeEmailAddress").length() > 0) {
+					// Get email data records into Emails memory object
+					Emails emails_1 = new Emails(csvRecord.get("HomeEmailType"), csvRecord.get("HomeEmailAddress"),
+							null,
+							Boolean.parseBoolean(csvRecord.get("HomeEmailPrimaryFlag").toLowerCase()));
+
+					// Add emails to the array list
+					emailsArrayList.add(emails_1);
+				}
+				/**** EXTERNAL IDENTIFIERS ****/
+
+				// Create ExternalIdentifiers array list to hold the different
+				// type of external identifiers.
+				ArrayList<ExternalIdentifiers> externalIdentifiersArrayList = new ArrayList<>();
+				// Create ExternalIdentifier object for external identifiers
+				ExternalIdentifiers externalIdentifiers = new ExternalIdentifiers();
+				if (csvRecord.get("ExternalIdentifierNumber") != null && csvRecord.get("ExternalIdentifierNumber").length() > 0) {
+					externalIdentifiers.setExternalIdentifierNumber(csvRecord.get("ExternalIdentifierNumber"));
+				}
+				if (csvRecord.get("ExternalIdentifierType") != null && csvRecord.get("ExternalIdentifierType").length() > 0) {
+					externalIdentifiers.setExternalIdentifierType(csvRecord.get("ExternalIdentifierType"));
+				}
+				if (csvRecord.get("FromDate") != null && csvRecord.get("FromDate").length() > 0) {
+					externalIdentifiers.setFromDate(csvRecord.get("FromDate"));
+				}
+
+				// Add external identifiers to the array list.
+				externalIdentifiersArrayList.add(externalIdentifiers);
+				
+				/**** LEGISLATIVE INFO ****/
+
+				// Create Legislative Info array list to hold the different
+				// types of legislative info
+                ArrayList<LegislativeInfo> legislativeInfoArrayList = new ArrayList<>();
+                // Create LegislativeInfo Object for legislative info
+                LegislativeInfo legislativeInfo = new LegislativeInfo();
+                if (csvRecord.get("LegislationCode1") != null && csvRecord.get("LegislationCode1").length() > 0) {
+                    legislativeInfo.setLegislationCode1(csvRecord.get("LegislationCode1"));
+                }
+                if (csvRecord.get("Gender") != null && csvRecord.get("Gender").length() > 0) {
+                    legislativeInfo.setGender(csvRecord.get("Gender"));
+                }
+                if (csvRecord.get("HighestEducationLevel") != null && csvRecord.get("HighestEducationLevel").length() > 0) {
+                    legislativeInfo.setHighestEducationLevel(csvRecord.get("HighestEducationLevel"));
+                }
+                if (csvRecord.get("MaritalStatus") != null && csvRecord.get("MaritalStatus").length() > 0) {
+                    legislativeInfo.setMaritalStatus(csvRecord.get("MaritalStatus"));
+                }
+
+
+                LegislativeInfoDDF legislativeInfoDDF = legislativeInfo.new LegislativeInfoDDF();
+
+
+                if (csvRecord.get("Veteran") != null && csvRecord.get("Veteran").length() > 0) {
+
+                    ArrayList<LegislativeInfoDDF> legislativeInfoDDFArrayList = new ArrayList<>();
+
+                    if (csvRecord.get("__FLEX_Context") != null && csvRecord.get("__FLEX_Context").length() > 0) {
+                        legislativeInfoDDF.set__FLEX_Context("US");
+                        legislativeInfoDDF.setVeteranSelfIdentification(csvRecord.get("Veteran"));
+
+                    }
+
+                    legislativeInfoDDFArrayList.add(legislativeInfoDDF);
+                    if (!legislativeInfoDDFArrayList.isEmpty()){
+                        legislativeInfo.setLegislativeInfoDDF(legislativeInfoDDFArrayList);
+                    }
+                }
+
+                if(csvRecord.get("Gender").length() > 0  || csvRecord.get("Veteran").length() > 0 || csvRecord.get("HighestEducationLevel").length() > 0 ){
+                    // Add LegislativeInfo to the array list
+                    legislativeInfoArrayList.add(legislativeInfo);
+                }
+
+				/**** ETHNICITIES ****/
+
+				ArrayList<Ethnicities> EthnicitiesList = new ArrayList<Ethnicities>();
+				Ethnicities ethnicities = new Ethnicities();
+				if(csvRecord.get("Race") != null && csvRecord.get("Race").length() > 0) {
+
+					if (csvRecord.get("RaceLegislationCode") != null && csvRecord.get("RaceLegislationCode").length() > 0) {
+						ethnicities.setLegislationCode(csvRecord.get("RaceLegislationCode"));
+					}
+					if (csvRecord.get("RacePrimaryFlag") != null && csvRecord.get("RacePrimaryFlag").length() > 0) {
+						ethnicities.setPrimaryFlag(Boolean.valueOf(csvRecord.get("RacePrimaryFlag")));
+					}
+
+					ethnicities.setEthnicity(csvRecord.get("Race"));
+
+					EthnicitiesList.add(ethnicities);
+				}
+
+				ArrayList<Disabilities> DisabilitiesList = new ArrayList<Disabilities>();
+				Disabilities disabilities = ethnicities.new Disabilities();
+				if (csvRecord.get("Disability") != null && csvRecord.get("Disability").length() > 0) {
+					disabilities.setSelfDisclosedType(csvRecord.get("Disability"));
+					
+					DisabilitiesList.add(disabilities);
+				}
+				/*
+				 * if(csvRecord.get("EmailAddress1") != null &&
+				 * csvRecord.get("EmailAddress1").length() >0) { Emails emails_2
+				 * = new Emails( csvRecord.get("EmailType1"),
+				 * csvRecord.get("EmailAddress1"),
+				 * Boolean.parseBoolean(csvRecord.get("PrimaryFlag3").
+				 * toLowerCase()) );
+				 * 
+				 * //Add emails to the array list emailsArrayList.add(emails_2);
+				 * }
+				 */
+
+				/**** NAMES ****/
+
+				// Create names array list to hold the name combinations
+				ArrayList<Names> namesArrayList = new ArrayList<Names>();
+
+				if (csvRecord.get("FirstName") != null && csvRecord.get("FirstName").length() > 0 && csvRecord.get("LastName") != null
+						&& csvRecord.get("LastName").length() > 0) {
+					// Get names data records into Names memory object
+					Names names = new Names();
+
+					names.setLastName(csvRecord.get("LastName"));
+					names.setFirstName(csvRecord.get("FirstName"));
+					if (csvRecord.get("MiddleNames") != null && csvRecord.get("MiddleNames").length() > 0) {
+						names.setMiddleNames(csvRecord.get("MiddleNames"));
+					}
+//					if (csvRecord.get("LegislationCode") != null && csvRecord.get("LegislationCode").length() > 0) {
+//						names.setLegislationCode2(csvRecord.get("LegislationCode"));
+//					}
+					if ((csvRecord.get("KnownAs") != null && csvRecord.get("KnownAs").length() > 0)) {
+						names.setKnownAs(csvRecord.get("KnownAs"));
+					}
+					if ((csvRecord.get("formerlastname") != null && csvRecord.get("formerlastname").length() > 0)) {
+						names.setPreviousLastName(csvRecord.get("formerlastname"));
+					}
+
+					// Add names to the names array list
+					namesArrayList.add(names);
+				}
+
+				/**** DRIVER LICENSE INFO ****/
+				//Create Drivers License array list to hold the drivers license information
+				ArrayList<DriverLicenses> driverLicenseInfoArrayList = new ArrayList<>();
+
+				if(csvRecord.get("DriverLicenseNumber") != null && csvRecord.get("DriverLicenseNumber").length() > 0){
+					//Get Drivers License Information into the DriverLicenseInfo memory object
+					DriverLicenses driverLicenseInfo = new DriverLicenses();
+
+					driverLicenseInfo.setLicenseNumber(csvRecord.get("DriverLicenseNumber"));
+
+					if(csvRecord.get("DriverLicenseState") != null && csvRecord.get("DriverLicenseState").length() > 0){
+						driverLicenseInfo.setIssuingLocation(csvRecord.get("DriverLicenseState"));
+					}
+
+					if(csvRecord.get("DriverLicenseCountry") != null && csvRecord.get("DriverLicenseCountry").length() > 0){
+						driverLicenseInfo.setIssuingCountry(csvRecord.get("DriverLicenseCountry"));
+					}
+
+					if(csvRecord.get("LicenseType") != null && csvRecord.get("LicenseType").length()>0){
+						driverLicenseInfo.setLicenseType(csvRecord.get("LicenseType"));
+					}
+
+					//Add drivers license information to the drivers license array list
+					driverLicenseInfoArrayList.add(driverLicenseInfo);
+				}
+
+				
+				/**** NATIONAL IDENTIFIERS ****/
+				
+				ArrayList<NationalIdentifiers> nationalIdentifiersList = new ArrayList<NationalIdentifiers>();
+				NationalIdentifiers nationalIdentifier = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber") != null && csvRecord.get("NationalIdentifierNumber").length() > 0) {
+					nationalIdentifier.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType") != null && csvRecord.get("NationalIdentifierType").length() > 0) {
+						nationalIdentifier.setNationalIdentifierType(csvRecord.get("NationalIdentifierType"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag") != null && csvRecord.get("NationalIdentifierPrimaryFlag").length() > 0) {
+						nationalIdentifier.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier);
+				}
+				
+				NationalIdentifiers nationalIdentifier1 = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber1") != null && csvRecord.get("NationalIdentifierNumber1").length() > 0) {
+					nationalIdentifier1.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber1"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier1.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType1") != null && csvRecord.get("NationalIdentifierType1").length() > 0) {
+						nationalIdentifier1.setNationalIdentifierType(csvRecord.get("NationalIdentifierType1"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag1") != null && csvRecord.get("NationalIdentifierPrimaryFlag1").length() > 0) {
+						nationalIdentifier1.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag1")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier1);
+				}
+				
+				NationalIdentifiers nationalIdentifier2 = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber2") != null && csvRecord.get("NationalIdentifierNumber2").length() > 0) {
+					nationalIdentifier2.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber2"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier2.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType2") != null && csvRecord.get("NationalIdentifierType2").length() > 0) {
+						nationalIdentifier2.setNationalIdentifierType(csvRecord.get("NationalIdentifierType2"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag2") != null && csvRecord.get("NationalIdentifierPrimaryFlag2").length() > 0) {
+						nationalIdentifier2.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag2")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier2);
+				}
+
+				/**** PHONES ****/
+
+				// Create Phones array list to hold the different types of
+				// phones
+				ArrayList<Phones> phonesArrayList = new ArrayList<>();
+
+				if (csvRecord.get("WorkPhoneType") != null && csvRecord.get("WorkPhoneType").length() > 0 && csvRecord.get("WorkPhoneNumber") != null
+						&& csvRecord.get("WorkPhoneNumber").length() > 0) {
+					// Create Phones Object for the home phone records
+					Phones homePhones = new Phones();
+
+					homePhones.setPhoneType(csvRecord.get("WorkPhoneType"));
+					homePhones.setPhoneNumber(csvRecord.get("WorkPhoneNumber"));
+
+					if (csvRecord.get("WorkLegislationCode") != null && csvRecord.get("WorkLegislationCode").length() > 0) {
+						homePhones.setLegislationCode(csvRecord.get("WorkLegislationCode"));
+					}
+
+					if (csvRecord.get("WorkAreaCode") != null && csvRecord.get("WorkAreaCode").length() > 0) {
+						homePhones.setAreaCode(csvRecord.get("AreaCode"));
+					}
+					if (csvRecord.get("WorkCountryCodeNumber") != null && csvRecord.get("WorkCountryCodeNumber").length() > 0) {
+						homePhones.setCountryCodeNumber(csvRecord.get("WorkCountryCodeNumber"));
+					}
+					if (csvRecord.get("WorkPrimaryFlag") != null && !csvRecord.get("WorkPrimaryFlag").isEmpty()) {
+						homePhones.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("WorkPrimaryFlag")));
+					}
+
+					// Add phones to array list
+					phonesArrayList.add(homePhones);
+
+				}
+
+				// Create Phones Object for the Phone1 records
+				if (csvRecord.get("HomePhoneType") != null && csvRecord.get("HomePhoneType").length() > 0 && csvRecord.get("HomePhoneNumber") != null
+						&& csvRecord.get("HomePhoneNumber").length() > 0) {
+					// Create Phones Object for the work phone records
+					Phones workPhones = new Phones();
+
+					workPhones.setPhoneType(csvRecord.get("HomePhoneType"));
+					workPhones.setPhoneNumber(csvRecord.get("HomePhoneNumber"));
+
+					if (csvRecord.get("HomeLegislationCode") != null && csvRecord.get("HomeLegislationCode").length() > 0) {
+						workPhones.setLegislationCode(csvRecord.get("HomeLegislationCode"));
+					}
+
+					if (csvRecord.get("HomeAreaCode") != null && csvRecord.get("HomeAreaCode").length() > 0) {
+						workPhones.setAreaCode(csvRecord.get("HomeAreaCode"));
+					}
+					if (csvRecord.get("HomeCountryCodeNumber") != null && csvRecord.get("HomeCountryCodeNumber").length() > 0) {
+						workPhones.setCountryCodeNumber(csvRecord.get("HomeCountryCodeNumber"));
+					}
+					if (csvRecord.get("HomePrimaryFlag") != null && !csvRecord.get("HomePrimaryFlag").isEmpty()) {
+						workPhones.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("HomePrimaryFlag")));
+					}
+
+					// Add phones to array list
+					phonesArrayList.add(workPhones);
+
+				}
+				if (csvRecord.get("Mobile_PhoneType") != null && csvRecord.get("Mobile_PhoneType").length() > 0 && 
+						csvRecord.get("Mobile_PhoneNumber") != null
+						&& csvRecord.get("Mobile_PhoneNumber").length() > 0) {
+					// Create Phones Object for the work phone records
+					Phones mobilePhones = new Phones();
+
+					mobilePhones.setPhoneType(csvRecord.get("Mobile_PhoneType"));
+					mobilePhones.setPhoneNumber(csvRecord.get("Mobile_PhoneNumber"));
+
+					if (csvRecord.get("Mobile_LegislationCode") != null && csvRecord.get("Mobile_LegislationCode").length() > 0) {
+						mobilePhones.setLegislationCode(csvRecord.get("Mobile_LegislationCode"));
+					}
+
+					if (csvRecord.get("Mobile_AreaCode") != null && csvRecord.get("Mobile_AreaCode").length() > 0) {
+						mobilePhones.setAreaCode(csvRecord.get("Mobile_AreaCode"));
+					}
+					if (csvRecord.get("Mobile_CountryCodeNumber") != null && csvRecord.get("Mobile_CountryCodeNumber").length() > 0) {
+						mobilePhones.setCountryCodeNumber(csvRecord.get("Mobile_CountryCodeNumber"));
+					}
+					if (csvRecord.get("Mobile_PrimaryFlag") != null && !csvRecord.get("Mobile_PrimaryFlag").isEmpty()) {
+						mobilePhones.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("Mobile_PrimaryFlag")));
+					}
+
+					// Add phones to array list
+					phonesArrayList.add(mobilePhones);
+
+				}
+
+
+				/**** WORK RELATIONSHIPS ****/
+
+				// Create work relationships array list to hold the work
+				// relationships
+				ArrayList<WorkRelationships> workRelationshipsArrayList = new ArrayList<WorkRelationships>();
+				// Get work relationships data records into WorkRelationships
+				// memory object
+				WorkRelationships workRelationships = new WorkRelationships();
+
+				if (csvRecord.get("LegalEmployerName") != null && csvRecord.get("LegalEmployerName").length() > 0) {
+					workRelationships.setLegalEmployerName(csvRecord.get("LegalEmployerName"));
+				}
+				if (csvRecord.get("WorkerType") != null && csvRecord.get("WorkerType").length() > 0) {
+					workRelationships.setWorkerType(csvRecord.get("WorkerType"));
+				}
+				if (csvRecord.get("ReadyToConvertFlag") != null && csvRecord.get("ReadyToConvertFlag").length() > 0) {
+					workRelationships.setReadyToConvertFlag(Boolean.parseBoolean(csvRecord.get("ReadyToConvertFlag")));
+				}
+				if (csvRecord.get("PrimaryFlag6") != null && csvRecord.get("PrimaryFlag6").length() > 0) {
+					workRelationships.setPrimaryFlag(Boolean.parseBoolean(csvRecord.get("PrimaryFlag6")));
+				}
+				
+				if (csvRecord.isMapped("ContractType") && !csvRecord.get("ContractType").isEmpty()) {
+					ArrayList<Contracts> contractList = new ArrayList<>();
+					Contracts contract = new Contracts();
+
+					contract.setContractType(csvRecord.get("ContractType"));
+				//	contract.setContractType("FIXED_CONTRACT");
+					if (!csvRecord.get("ContractEndDate").isEmpty()) {
+						contract.setContractEndDate(csvRecord.get("ContractEndDate"));
+					}
+					contractList.add(contract);
+					workRelationships.setContracts(contractList);
+				}
+
+				ArrayList<workRelationshipsDFF> workRelationshipsDFFArrayList = new ArrayList<>();
+				workRelationshipsDFF workDFF = workRelationships.new workRelationshipsDFF();
+				if (csvRecord.get("__FLEX_Context1") != null && csvRecord.get("__FLEX_Context1").length() > 0) {
+					workDFF.set__FLEX_Context(csvRecord.get("__FLEX_Context1"));
+
+
+				workRelationshipsDFFArrayList.add(workDFF);
+				}
+				if (!workRelationshipsDFFArrayList.isEmpty()){
+					workRelationships.setWorkRelationshipsDFF(workRelationshipsDFFArrayList);
+				}
+
+				// Add workrelationships to the workrelationships array list
+				workRelationshipsArrayList.add(workRelationships);
+
+				/**** ASSIGNMENTS ****/
+
+				// Create assignments array list to hold the assignments
+				ArrayList<Assignments> assignmentsArrayList = new ArrayList<Assignments>();
+				// Get assignments data records into Asignments memory object
+				Assignments assignments = new Assignments();
+
+				if (csvRecord.get("BusinessUnitName") != null && csvRecord.get("BusinessUnitName").length() > 0) {
+					assignments.setBusinessUnitName(csvRecord.get("BusinessUnitName"));
+				}
+				if (csvRecord.get("ActionCode") != null && csvRecord.get("ActionCode").length() > 0) {
+					assignments.setActionCode(csvRecord.get("ActionCode"));
+				}
+				if (csvRecord.get("ActionReason") != null && csvRecord.get("ActionReason").length() > 0) {
+					assignments.setReasonCode(csvRecord.get("ActionReason"));
+				}
+				if (csvRecord.get("AssignmentCategory") != null && csvRecord.get("AssignmentCategory").length() > 0) {
+					assignments.setAssignmentCategory(csvRecord.get("AssignmentCategory"));
+				}
+				if (csvRecord.get("ProjectedStartDate") != null && csvRecord.get("ProjectedStartDate").length() > 0) {
+					assignments.setProjectedStartDate(csvRecord.get("ProjectedStartDate"));
+				}
+				if (csvRecord.get("ProposedUserPersonType") != null && csvRecord.get("ProposedUserPersonType").length() > 0) {
+					assignments.setProposedUserPersonType(csvRecord.get("ProposedUserPersonType"));
+				}
+				if (csvRecord.get("JobCode") != null && csvRecord.get("JobCode").length() > 0) {
+					assignments.setJobCode(csvRecord.get("JobCode"));
+				}
+				if (csvRecord.get("DepartmentName") != null && csvRecord.get("DepartmentName").length() > 0) {
+					assignments.setDepartmentName(csvRecord.get("DepartmentName"));
+				}
+				if (csvRecord.get("LocationId") != null && csvRecord.get("LocationId").length() > 0) {
+					assignments.setLocationId(csvRecord.get("LocationId"));
+				}
+				if (csvRecord.get("WorkAtHomeFlag") != null && !csvRecord.get("WorkAtHomeFlag").isEmpty()) {
+					assignments.setWorkAtHomeFlag(Boolean.parseBoolean(csvRecord.get("WorkAtHomeFlag")));
+				}
+				if (csvRecord.get("PermanentTemporary") != null && csvRecord.get("PermanentTemporary").length() > 0) {
+					assignments.setPermanentTemporary(csvRecord.get("PermanentTemporary"));
+				}
+				if (csvRecord.get("FullPartTime") != null && csvRecord.get("FullPartTime").length() > 0) {
+					assignments.setFullPartTime(csvRecord.get("FullPartTime"));
+				}
+				if (csvRecord.get("ManagerFlag") != null && !csvRecord.get("ManagerFlag").isEmpty()) {
+					assignments.setManagerFlag(Boolean.parseBoolean(csvRecord.get("ManagerFlag")));
+				}
+				if (csvRecord.get("NormalHours") != null && csvRecord.get("NormalHours").length() > 0) {
+					assignments.setNormalHours(Double.valueOf(csvRecord.get("NormalHours")));
+				}
+				if (csvRecord.get("Frequency") != null && csvRecord.get("Frequency").length() > 0) {
+					assignments.setFrequency(csvRecord.get("Frequency"));
+				}
+				if (csvRecord.get("ProbationPeriod") != null && csvRecord.get("ProbationPeriod").length() > 0) {
+					assignments.setProbationPeriod(Integer.parseInt(csvRecord.get("ProbationPeriod")));
+				}
+				if (csvRecord.get("ProbationPeriodUnit") != null && csvRecord.get("ProbationPeriodUnit").length() > 0) {
+					assignments.setProbationPeriodUnit(csvRecord.get("ProbationPeriodUnit"));
+				}
+				if (csvRecord.get("WorkerCategory") != null && csvRecord.get("WorkerCategory").length() > 0) {
+					assignments.setWorkerCategory(csvRecord.get("WorkerCategory"));
+				}
+				ArrayList<assignmentsDFF> assignmentsDFFArrayList = new ArrayList<>();
+				assignmentsDFF assignDFF = assignments.new assignmentsDFF();
+				if (csvRecord.get("__FLEX_Context") != null && csvRecord.get("__FLEX_Context").length() > 0) {
+					if (csvRecord.get("pfgPayGroup") != null && csvRecord.get("pfgPayGroup").length() > 0) {
+						assignDFF.setPfgPayGroup(csvRecord.get("pfgPayGroup"));
+					}
+					assignDFF.set__FLEX_Context(csvRecord.get("__FLEX_Context"));
+					
+					if (csvRecord.get("pfgPiclBenefits") != null && csvRecord.get("pfgPiclBenefits").length() > 0) {
+						assignDFF.setPfgPiclBenefits(csvRecord.get("pfgPiclBenefits"));
+					}
+					
+					if (csvRecord.get("pfgGerencia") != null && csvRecord.get("pfgGerencia").length() > 0) {
+						assignDFF.setPfgGerencia(csvRecord.get("pfgGerencia"));
+					}
+					
+				assignmentsDFFArrayList.add(assignDFF);
+				}
+				if (!assignmentsDFFArrayList.isEmpty()){
+					assignments.setAssignmentsDFF(assignmentsDFFArrayList);
+				}
+//				if (csvRecord.get("GradeCode") != null && csvRecord.get("GradeCode").length() > 0) {
+//					assignments.setGradeCode(csvRecord.get("GradeCode"));
+//				}
+//				if (csvRecord.get("GradeName") != null && csvRecord.get("GradeName").length() > 0) {
+//					assignments.setGradeName(csvRecord.get("GradeName"));
+//				}
+
+					// Add assignments to the assignments array list
+				assignmentsArrayList.add(assignments);
+
+				/**** MANAGERS ****/
+
+				// Create managers array list to hold the managers
+				ArrayList<Managers> managersArrayList = new ArrayList<Managers>();
+				// Get managers data records into Managers memory object
+                if (csvRecord.isMapped("ManagerPersonNumber")  && csvRecord.get("ManagerPersonNumber").length() > 0) {
+					Managers managers = new Managers();
+					managers.setPersonNumber(csvRecord.get("ManagerPersonNumber"));
+
+					if (csvRecord.get("ManagerType") != null && csvRecord.get("ManagerType").length() > 0) {
+						managers.setManagerType(csvRecord.get("ManagerType"));
+					}
+
+					// Add managers to the managers array list
+					managersArrayList.add(managers);
+				}
+                
+                /**** SALARY ****/
+
+				// Create salary array list to hold the salary details
+				ArrayList<Salary> salaryArrayList = new ArrayList<Salary>();
+				
+				Salary salary = new Salary();
+				if (csvRecord.get("SalaryAmount") != null && csvRecord.get("SalaryAmount").length() > 0) {
+					salary.setSalaryAmount(csvRecord.get("SalaryAmount"));
+				}
+				if (csvRecord.get("SalaryBasisCode") != null && csvRecord.get("SalaryBasisCode").length() > 0) {
+					salary.setSalaryBasisCode(csvRecord.get("SalaryBasisCode"));
+				}
+				if (csvRecord.get("SalaryActionCode") != null && csvRecord.get("SalaryActionCode").length() > 0) {
+					salary.setSalaryActionCode(csvRecord.get("SalaryActionCode"));
+				}
+				if (csvRecord.get("SalFrequency") != null && csvRecord.get("SalFrequency").length() > 0) {
+					salary.setSalFrequency(csvRecord.get("SalFrequency"));
+				}
+
+				//Add salary details to array list
+				salaryArrayList.add(salary);
+				
+
+				/**** WORK MEASURES ****/
+				// Create work measures array list
+				ArrayList<WorkMeasures> workMeasuresArrayList = new ArrayList<WorkMeasures>();
+				if (csvRecord.get("FTE_Value") != null && csvRecord.get("FTE_Value").length()>0) {
+					// Get Work Measures FTE data records into Work Measures memory object
+					WorkMeasures workMeasuresFTE = new WorkMeasures();
+
+  					workMeasuresFTE.setValue(Double.valueOf(csvRecord.get("FTE_Value")));
+
+					if(csvRecord.get("FTE_Unit") != null && csvRecord.get("FTE_Unit").length()>0){
+						workMeasuresFTE.setUnit(csvRecord.get("FTE_Unit"));
+					}
+
+					// Add workMeasuresFTE to workMeasuresArrayList
+					workMeasuresArrayList.add(workMeasuresFTE);
+
+					// Get Work Measures FTE data records into Work Measures memory object
+					WorkMeasures workMeasuresHEAD = new WorkMeasures();
+
+					if(csvRecord.get("HEAD_Value") != null && csvRecord.get("HEAD_Value").length()>0){
+						workMeasuresHEAD.setValue(Double.valueOf(csvRecord.get("HEAD_Value")));
+					}
+					if(csvRecord.get("HEAD_Unit") != null && csvRecord.get("HEAD_Unit").length()>0){
+						workMeasuresHEAD.setUnit(csvRecord.get("HEAD_Unit"));
+					}
+
+					// Add workMeasuresHEAD data to workMeasuresArrayList
+					workMeasuresArrayList.add(workMeasuresHEAD);
+
+				}
+				
+				/**** CITIZENSHIP ****/
+
+				// Create citizenship array list to hold the citizenship info
+				ArrayList<Citizenships> citizenshipsArrayList = new ArrayList<Citizenships>();
+				// Get citizenship data into Citizenships memory object
+				if (csvRecord.isMapped("Citizenship") && csvRecord.get("Citizenship").length() > 0) {
+					Citizenships citizenship = new Citizenships();
+					citizenship.setCitizenship(csvRecord.get("Citizenship"));
+
+					citizenship.setCitizenshipStatus("A");
+
+					// Add citizenship to the citizenships array list
+					citizenshipsArrayList.add(citizenship);
+				}
+
+				/**** ADD Data to Array Lists in Objects ****/
+
+				// Will embed the objects arrays inside WorkRelationship and
+				// Assigments/Managers objects
+				if (!managersArrayList.isEmpty()) {
+					assignments.setManagers(managersArrayList);
+				}
+				//Assignments/WorkMeasures object
+				if (!workMeasuresArrayList.isEmpty()){
+					assignments.setWorkMeasures(workMeasuresArrayList);
+				}
+
+
+				workRelationships.setAssignments(assignmentsArrayList);
+
+				// Add ArrayLists content to the Pending Worker memory object.
+				// If they are empty, then it will not add them.
+				if (!addressesArrayList.isEmpty()) {
+					reHireWorker.setAddresses(addressesArrayList);
+				}
+				if (!emailsArrayList.isEmpty()) {
+					reHireWorker.setEmailsArrayList(emailsArrayList);
+				}
+				if (!externalIdentifiersArrayList.isEmpty()) {
+					reHireWorker.setExternalIdentifiers(externalIdentifiersArrayList);
+				}
+				if (!legislativeInfoArrayList.isEmpty()) {
+					reHireWorker.setLegislativeInfo(legislativeInfoArrayList);
+				}
+				if (!namesArrayList.isEmpty()) {
+					reHireWorker.setNamesArrayList(namesArrayList);
+				}
+				if (!driverLicenseInfoArrayList.isEmpty()){
+					reHireWorker.setDriverLicenseArrayList(driverLicenseInfoArrayList);
+				}
+				if (!phonesArrayList.isEmpty()) {
+					reHireWorker.setPhones(phonesArrayList);
+				}
+				
+				if(!nationalIdentifiersList.isEmpty()){
+					reHireWorker.setNationalIdentifiers(nationalIdentifiersList);
+				}
+				
+				reHireWorker.setWorkRelationshipsArrayList(workRelationshipsArrayList);
+
+				if(!EthnicitiesList.isEmpty()){
+					reHireWorker.setEthnicities(EthnicitiesList);
+				}
+				
+				if(!DisabilitiesList.isEmpty()){
+					reHireWorker.setDisabilities(DisabilitiesList);
+				}
+				
+				if(!citizenshipsArrayList.isEmpty()){
+					reHireWorker.setCitizenships(citizenshipsArrayList);
+				}
+
+				// Add all the rehire worker information into the rehire worker
+				// list.
+				// reHireWorkerList.add(reHireWorker);
+
+				/** Get PersonNumber **/
+				String personNumber = "";
+				if (csvRecord.isMapped("PersonNumber") && !csvRecord.get("PersonNumber").isEmpty()) {
+					personNumber = csvRecord.get("PersonNumber");
+				}
+
+				/** Get WorkflowId **/
+				String workflowId = "";
+				if (csvRecord.isMapped("WorkflowID") && !csvRecord.get("WorkflowID").isEmpty()) {
+					workflowId = csvRecord.get("WorkflowID");
+				}
+
+				String currentRelationship = "";
+				if(csvRecord.isMapped("RelationshipType") && !csvRecord.get("RelationshipType").isEmpty()){
+					currentRelationship = csvRecord.get("RelationshipType");
+				}
+
+				data.add(new ApiData(personNumber, reHireWorker, workflowId, currentRelationship, salary));
+
+			}
+
+		} catch (IOException e) {
+			logger.severe(e.getMessage());
+			captureErrorMsgs.add("Error Processing Re-Hire file: ("+e.getMessage()+e.toString()+")");
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			// Generate Error Email
+			sendGenericErrorEmail(errorMessage.getErrorMessage());
+		}
+		finally {
+			logger.info("Done reading file!");
+		}
+
+		return data;
+
+	}
+
+	private static List<ApiData> internalHireFile(String filePath) {
+
+		// Create Error Handling Objects
+		ErrorMessage errorMessage = new ErrorMessage();
+		ArrayList<String> captureErrorMsgs = new ArrayList<>();
+
+		// Create a list to hold the pending worker information that will be
+		// used for the json.
+		// List<PendingWorker> internalHireWorkerList = new
+		// ArrayList<PendingWorker>();
+		List<ApiData> data = new ArrayList<>();
+		Logger logger = Logger.getLogger("HCMLoader");
+
+		// Read the CSV File
+		try (Reader reader = Files.newBufferedReader(Paths.get(filePath));
+				CSVParser csvParser = new CSVParser(reader,
+						CSVFormat.RFC4180.withFirstRecordAsHeader().withDelimiter('|').withIgnoreHeaderCase().withTrim()) // .DEFAULT.withFirstRecordAsHeader().withIgnoreHeaderCase().withTrim());
+		) {
+
+			// Retrieve all the records from the file at once into memory
+			Iterable<CSVRecord> csvRecords = csvParser.getRecords();
+
+			// test Record Read
+			// System.out.println(csvRecords);
+
+			// Loop through the CSV Records
+			for (CSVRecord csvRecord : csvRecords) {
+
+				// Get ReHire Worker Data records into ReHire memory object
+				PendingWorker internalHireWorker = new PendingWorker();
+				
+				if (csvRecord.get("DateOfBirth") != null && csvRecord.get("DateOfBirth").length() > 0) {
+					
+					internalHireWorker.setDateOfBirth(csvRecord.get("DateOfBirth"));
+				}
+				
+				/*if (csvRecord.get("RegionOfBirth") != null && csvRecord.get("RegionOfBirth").length() > 0) {
+					
+					internalHireWorker.setRegionOfBirth(csvRecord.get("RegionOfBirth"));
+				}
+
+				if (csvRecord.get("TownOfBirth") != null && csvRecord.get("TownOfBirth").length() > 0) {
+	
+					internalHireWorker.setTownOfBirth(csvRecord.get("TownOfBirth"));
+				}*/
+
+				/**** SALARY ****/
+
+				// Create salary array list to hold the salary details
+				ArrayList<Salary> salaryArrayList = new ArrayList<Salary>();
+				
+				Salary salary = new Salary();
+				if (csvRecord.get("SalaryAmount") != null && csvRecord.get("SalaryAmount").length() > 0) {
+					salary.setSalaryAmount(csvRecord.get("SalaryAmount"));
+				}
+				if (csvRecord.get("SalaryBasisCode") != null && csvRecord.get("SalaryBasisCode").length() > 0) {
+					salary.setSalaryBasisCode(csvRecord.get("SalaryBasisCode"));
+				}
+				if (csvRecord.get("SalFrequency") != null && csvRecord.get("SalFrequency").length() > 0) {
+					salary.setSalFrequency(csvRecord.get("SalFrequency"));
+				}
+				/*if (csvRecord.get("SalaryActionCode") != null && csvRecord.get("SalaryActionCode").length() > 0) {
+					salary.setSalaryActionCode(csvRecord.get("SalaryActionCode"));
+				}*/
+				
+				//Add salary details to array list
+				salaryArrayList.add(salary);
+				
+				/**** ASSIGNMENTS ****/
+
+				// Create assignments array list to hold the assignments
+				ArrayList<Assignments> assignmentsArrayList = new ArrayList<Assignments>();
+				// Get assignments data records into Asignments memory object
+				Assignments assignments = new Assignments();
+
+				if (csvRecord.get("BusinessUnitName") != null && csvRecord.get("BusinessUnitName").length() > 0) {
+					assignments.setBusinessUnitName(csvRecord.get("BusinessUnitName"));
+				}
+				if (csvRecord.get("ActionCode") != null && csvRecord.get("ActionCode").length() > 0) {
+					assignments.setActionCode(csvRecord.get("ActionCode"));
+				}
+				if (csvRecord.get("ActionReason") != null && csvRecord.get("ActionReason").length() > 0) {
+					assignments.setReasonCode(csvRecord.get("ActionReason"));
+				}
+				if (csvRecord.get("AssignmentCategory") != null && csvRecord.get("AssignmentCategory").length() > 0) {
+					assignments.setAssignmentCategory(csvRecord.get("AssignmentCategory"));
+				}
+				if (csvRecord.get("ProjectedStartDate") != null && csvRecord.get("ProjectedStartDate").length() > 0) {
+					assignments.setProjectedStartDate(csvRecord.get("ProjectedStartDate"));
+				}
+				// if(csvRecord.get("ProposedUserPersonType") != null &&
+				// csvRecord.get("ProposedUserPersonType").length()>0) {
+				// assignments.setProposedUserPersonType(csvRecord.get("ProposedUserPersonType"));
+				// }
+				if (csvRecord.get("JobCode") != null && csvRecord.get("JobCode").length() > 0) {
+					assignments.setJobCode(csvRecord.get("JobCode"));
+				}
+				if (csvRecord.get("DepartmentName") != null && csvRecord.get("DepartmentName").length() > 0) {
+					assignments.setDepartmentName(csvRecord.get("DepartmentName"));
+				}
+				if (csvRecord.get("LocationId") != null && csvRecord.get("LocationId").length() > 0) {
+					assignments.setLocationId(csvRecord.get("LocationId"));
+				}
+				if (csvRecord.get("WorkAtHomeFlag") != null && !csvRecord.get("WorkAtHomeFlag").isEmpty()) {
+					assignments.setWorkAtHomeFlag(Boolean.parseBoolean(csvRecord.get("WorkAtHomeFlag")));
+				}
+				if (csvRecord.get("PermanentTemporary") != null && csvRecord.get("PermanentTemporary").length() > 0) {
+					assignments.setPermanentTemporary(csvRecord.get("PermanentTemporary"));
+				}
+				if (csvRecord.get("FullPartTime") != null && csvRecord.get("FullPartTime").length() > 0) {
+					assignments.setFullPartTime(csvRecord.get("FullPartTime"));
+				}
+				if (csvRecord.get("ManagerFlag") != null && !csvRecord.get("ManagerFlag").isEmpty()) {
+					assignments.setManagerFlag(Boolean.parseBoolean(csvRecord.get("ManagerFlag")));
+				}
+				if (csvRecord.get("NormalHours") != null && csvRecord.get("NormalHours").length() > 0) {
+					assignments.setNormalHours(Double.valueOf(csvRecord.get("NormalHours")));
+				}
+				if (csvRecord.get("Frequency") != null && csvRecord.get("Frequency").length() > 0) {
+					assignments.setFrequency(csvRecord.get("Frequency"));
+				}
+				if (csvRecord.get("ProbationPeriod") != null && csvRecord.get("ProbationPeriod").length() > 0) {
+					assignments.setProbationPeriod(Double.valueOf(csvRecord.get("ProbationPeriod")));
+				}
+				if (csvRecord.get("ProbationPeriodUnit") != null && csvRecord.get("ProbationPeriodUnit").length() > 0) {
+					assignments.setProbationPeriodUnit(csvRecord.get("ProbationPeriodUnit"));
+				}
+				if (csvRecord.get("WorkerCategory") != null && csvRecord.get("WorkerCategory").length() > 0) {
+					assignments.setWorkerCategory(csvRecord.get("WorkerCategory"));
+				}
+				ArrayList<assignmentsDFF> assignmentsDFFArrayList = new ArrayList<>();
+				assignmentsDFF assignDFF = assignments.new assignmentsDFF();
+				if (csvRecord.get("__FLEX_Context") != null && csvRecord.get("__FLEX_Context").length() > 0) {
+					assignDFF.set__FLEX_Context(csvRecord.get("__FLEX_Context"));
+					
+					if (csvRecord.get("pfgPiclBenefits") != null && csvRecord.get("pfgPiclBenefits").length() > 0) {
+						assignDFF.setPfgPiclBenefits(csvRecord.get("pfgPiclBenefits"));
+					}
+					
+					if (csvRecord.get("pfgGerencia") != null && csvRecord.get("pfgGerencia").length() > 0) {
+						assignDFF.setPfgGerencia(csvRecord.get("pfgGerencia"));
+					}
+					
+				assignmentsDFFArrayList.add(assignDFF);
+				}
+				if (!assignmentsDFFArrayList.isEmpty()){
+					assignments.setAssignmentsDFF(assignmentsDFFArrayList);
+				}
+//				if (csvRecord.get("GradeCode") != null && csvRecord.get("GradeCode").length() > 0) {
+//					assignments.setGradeCode(csvRecord.get("GradeCode"));
+//				}
+				/*if (csvRecord.get("GradeName") != null && csvRecord.get("GradeName").length() > 0) {
+					assignments.setGradeName(csvRecord.get("GradeName"));
+				}*/
+
+				
+				
+				/**** NATIONAL IDENTIFIERS ****/
+				
+				ArrayList<NationalIdentifiers> nationalIdentifiersList = new ArrayList<NationalIdentifiers>();
+				NationalIdentifiers nationalIdentifier = new NationalIdentifiers();
+				if(csvRecord.get("NationalIdentifierNumber") != null && csvRecord.get("NationalIdentifierNumber").length() > 0) {
+					nationalIdentifier.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType") != null && csvRecord.get("NationalIdentifierType").length() > 0) {
+						nationalIdentifier.setNationalIdentifierType(csvRecord.get("NationalIdentifierType"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag") != null && csvRecord.get("NationalIdentifierPrimaryFlag").length() > 0) {
+						nationalIdentifier.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier);
+				}
+				
+		/*		if(csvRecord.get("NationalIdentifierNumber1") != null && csvRecord.get("NationalIdentifierNumber1").length() > 0) {
+					nationalIdentifier.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber1"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType1") != null && csvRecord.get("NationalIdentifierType1").length() > 0) {
+						nationalIdentifier.setNationalIdentifierType(csvRecord.get("NationalIdentifierType1"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag1") != null && csvRecord.get("NationalIdentifierPrimaryFlag1").length() > 0) {
+						nationalIdentifier.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag1")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier);
+				}
+				
+				if(csvRecord.get("NationalIdentifierNumber2") != null && csvRecord.get("NationalIdentifierNumber2").length() > 0) {
+					nationalIdentifier.setNationalIdentifierNumber(csvRecord.get("NationalIdentifierNumber2"));
+
+					if (csvRecord.get("NationalIdentifierLegislationCode") != null && csvRecord.get("NationalIdentifierLegislationCode").length() > 0) {
+						nationalIdentifier.setLegislationCode(csvRecord.get("NationalIdentifierLegislationCode"));
+					}
+					if (csvRecord.get("NationalIdentifierType2") != null && csvRecord.get("NationalIdentifierType2").length() > 0) {
+						nationalIdentifier.setNationalIdentifierType(csvRecord.get("NationalIdentifierType2"));
+					}
+					if (csvRecord.get("NationalIdentifierPrimaryFlag2") != null && csvRecord.get("NationalIdentifierPrimaryFlag2").length() > 0) {
+						nationalIdentifier.setPrimaryFlag(Boolean.valueOf(csvRecord.get("NationalIdentifierPrimaryFlag2")));
+					}
+
+					nationalIdentifiersList.add(nationalIdentifier);
+				}*/
+
+				/**** MANAGERS ****/
+
+				// Create managers array list to hold the managers
+				ArrayList<Managers> managersArrayList = new ArrayList<Managers>();
+				// Get managers data records into Managers memory object
+                if (csvRecord.isMapped("ManagerPersonNumber")  && csvRecord.get("ManagerPersonNumber").length() > 0) {
+					Managers managers = new Managers();
+					managers.setPersonNumber(csvRecord.get("ManagerPersonNumber"));
+					if (csvRecord.get("ManagerType") != null && csvRecord.get("ManagerType").length() > 0) {
+						managers.setManagerType(csvRecord.get("ManagerType"));
+					}
+
+					// Add managers to the managers array list
+					managersArrayList.add(managers);
+				}
+
+				/**** WORK MEASURES ****/
+				// Create work measures array list
+				ArrayList<WorkMeasures> workMeasuresArrayList = new ArrayList<WorkMeasures>();
+				if (csvRecord.get("FTE_Value") != null && csvRecord.get("FTE_Value").length()>0) {
+
+					// Get Work Measures FTE data records into Work Measures memory object
+					WorkMeasures workMeasuresFTE = new WorkMeasures();
+
+					workMeasuresFTE.setValue(Double.valueOf(csvRecord.get("FTE_Value")));
+
+					if(csvRecord.get("FTE_Unit") != null && csvRecord.get("FTE_Unit").length()>0){
+						workMeasuresFTE.setUnit(csvRecord.get("FTE_Unit"));
+					}
+
+					// Add workMeasuresFTE to workMeasuresArrayList
+					workMeasuresArrayList.add(workMeasuresFTE);
+
+					// Get Work Measures HEAD data records into Work Measures memory object
+					WorkMeasures workMeasuresHEAD = new WorkMeasures();
+
+					if(csvRecord.get("HEAD_Value") != null && csvRecord.get("HEAD_Value").length()>0){
+						workMeasuresHEAD.setValue(Double.valueOf(csvRecord.get("HEAD_Value")));
+					}
+					if(csvRecord.get("HEAD_Unit") != null && csvRecord.get("HEAD_Unit").length()>0){
+						workMeasuresHEAD.setUnit(csvRecord.get("HEAD_Unit"));
+					}
+
+					// Add workMeasuresHEAD data to workMeasuresArrayList
+					workMeasuresArrayList.add(workMeasuresHEAD);
+
+				}
+
+				/** External Identifiers **/
+				// Create ExternalIdentifiers array list to hold the different
+				// type of external identifiers.
+				ArrayList<ExternalIdentifiers> externalIdentifiersArrayList = new ArrayList<>();
+				// Create ExternalIdentifier object for external identifiers
+				ExternalIdentifiers externalIdentifiers = new ExternalIdentifiers();
+				if (csvRecord.get("ExternalIdentifierNumber") != null && csvRecord.get("ExternalIdentifierNumber").length() > 0) {
+					externalIdentifiers.setExternalIdentifierNumber(csvRecord.get("ExternalIdentifierNumber"));
+				}
+				if (csvRecord.get("ExternalIdentifierType") != null && csvRecord.get("ExternalIdentifierType").length() > 0) {
+					externalIdentifiers.setExternalIdentifierType(csvRecord.get("ExternalIdentifierType"));
+				}
+				/*if (csvRecord.get("FromDate") != null && csvRecord.get("FromDate").length() > 0) {
+					externalIdentifiers.setFromDate(csvRecord.get("FromDate"));
+				}*/
+				// Add external identifiers to the array list.
+				externalIdentifiersArrayList.add(externalIdentifiers);
+				internalHireWorker.setExternalIdentifiers(externalIdentifiersArrayList);
+
+
+				/**** ADD Data to Array Lists in Objects ****/
+
+				// Will embed the objects arrays inside WorkRelationship and
+				// Assigments/Managers objects
+				if (!managersArrayList.isEmpty()) {
+					assignments.setManagers(managersArrayList);
+				}
+				//Assignments/WorkMeasures object
+				if (!workMeasuresArrayList.isEmpty()){
+					assignments.setWorkMeasures(workMeasuresArrayList);
+				}
+
+				if(!nationalIdentifiersList.isEmpty()){
+					internalHireWorker.setNationalIdentifiers(nationalIdentifiersList);
+				}
+
+
+				// Add assignments to the assignments array list
+				assignmentsArrayList.add(assignments);
+				
+				// Add ArrayLists content to the Pending Worker memory object.
+				// If they are empty, then it will not add them.
+				//internalHireWorker.setAssignmentsInternalHires(assignmentsArrayList);
+				WorkRelationships relationships = new WorkRelationships();
+
+				/** ADD CONTRACTS **/
+				if (csvRecord.isMapped("ContractType") && !csvRecord.get("ContractType").isEmpty()) {
+					ArrayList<Contracts> contractList = new ArrayList<>();
+					Contracts contract = new Contracts();
+
+					contract.setContractType(csvRecord.get("ContractType"));
+					if (!csvRecord.get("ContractEndDate").isEmpty()) {
+						contract.setContractEndDate(csvRecord.get("ContractEndDate"));
+					}
+					contractList.add(contract);
+					relationships.setContracts(contractList);
+				}
+
+				relationships.setAssignments(assignmentsArrayList);
+				ArrayList<WorkRelationships> relationshipsList = new ArrayList<>();
+				relationshipsList.add(relationships);
+				internalHireWorker.setWorkRelationshipsArrayList(relationshipsList);
+
+				// Add all the pending worker information into the pending
+				// worker list.
+				// internalHireWorkerList.add(internalHireWorker);
+
+				/** Get PersonNumber **/
+				String personNumber = "";
+				if (csvRecord.isMapped("PersonNumber") && !csvRecord.get("PersonNumber").isEmpty()) {
+					personNumber = csvRecord.get("PersonNumber");
+				}
+
+				/** Get WorkflowId **/
+				String workflowId = "";
+				if (csvRecord.isMapped("WorkflowID") && !csvRecord.get("WorkflowID").isEmpty()) {
+					workflowId = csvRecord.get("WorkflowID");
+				}
+
+				data.add(new ApiData(personNumber, internalHireWorker, workflowId, "", salary));
+
+			}
+
+		} catch (IOException e) {
+			logger.severe(e.getMessage());
+			captureErrorMsgs.add("Error Processing Internal Hire file: ("+e.getMessage()+e.toString()+")");
+			errorMessage.setErrorMessageList(captureErrorMsgs);
+			// Generate Error Email
+			sendGenericErrorEmail(errorMessage.getErrorMessage());
+		}
+		return data;
+
+	}
+
+	public static void sendGenericErrorEmail(String errorMessage){
+		EmailUtility.generateGenericMainClassEmail(errorMessage);
+	}
+
+	public static void sendHCMErrorEmail(String applicantId, ArrayList<String> errorList,ApiData dataType){
+
+		String fileName = null;
+		String personNum = dataType.getPersonNumber();
+		String BU = dataType.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getBusinessUnitName();
+		String DOJ = dataType.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getProjectedStartDate();
+		String JobCode = dataType.getPendingWorker().getWorkRelationships().get(0).getAssignments().get(0).getJobCode();
+		switch(dataType.getType()){
+			case NEWHIRE:
+				fileName = "ICIMS_HCM_WORKER.csv";
+				break;
+			case REHIRE:
+				fileName = "ICIMS_HCM_REHIRE.csv";
+				break;
+			case INTERNAL:
+				fileName = "ICIMS_HCM_INT_HIRE.csv";
+				break;
+		}
+
+		EmailUtility.generateErrorEmail(applicantId, errorList, fileName, personNum, BU, DOJ, JobCode);
+	}
+}
+
